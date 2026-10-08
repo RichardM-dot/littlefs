@@ -1,4 +1,9 @@
 /*
+ * 【中文导读】lfs_util.c —— CRC32 与工具函数（B级导读）
+ * 元数据提交的完整性全靠这里的 CRC32（每条记录带校验）；另有
+ * lfs_aligndown/alignup、伪随机数、调试打印等小工具。
+ */
+/*
  * lfs util functions
  *
  * Copyright (c) 2022, The littlefs authors.

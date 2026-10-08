@@ -1,4 +1,12 @@
 /*
+ * ============================================================================
+ * 【中文导读】lfs.h —— littlefs 公共 API 与配置（B级导读）
+ * 移植接口在 lfs_config 结构体：实现 read/prog/erase/sync 四个回调即可把
+ * littlefs 搬到任何块设备上（SPI Flash/SD/片内Flash）。LFS_INLINE 宏定义
+ * 与配置常量的中文解释见官方注释；lfs_file_config 决定缓冲策略。
+ * ============================================================================
+ */
+/*
  * The little filesystem
  *
  * Copyright (c) 2022, The littlefs authors.

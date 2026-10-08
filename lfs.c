@@ -1,4 +1,32 @@
 /*
+ * ============================================================================
+ * 【中文导读】lfs.c —— littlefs 文件系统核心实现（全库精华，一个文件即全部）
+ * ----------------------------------------------------------------------------
+ * littlefs 的两大设计目标（先读 DESIGN.md 再读本文件，事半功倍）：
+ *   1. 掉电安全（power-loss resilience）: 任何时刻断电，文件系统都能恢复到
+ *      上一次一致状态。核心机制 = 写时复制(copy-on-write) + 元数据双块轮换。
+ *   2. 磨损均衡（wear leveling）: 没有主动搬块，靠"每次提交写到另一块"的
+ *      双块轮转自然分散写入。
+ *
+ * 本文件结构（自上而下，建议按此顺序读）：
+ *   - 块设备缓存层:       lfs_cache_*（RAM 缓存，减少小 IO）
+ *   - CRC 校验:           lfs_crc / lfs_dir_crc
+ *   - 路径操作:           lfs_path_*
+ *   - 元数据块对操作:     lfs_dir_*（双块轮换的提交/分裂/合并全在这）
+ *   - 32位tag系统:        lfs_tag_*（littlefs v2 用 tag 索引一切对象）
+ *   - 文件操作:           lfs_file_*（打开/读写/seek/同步）
+ *   - 目录操作:           lfs_dir_*（用户可见的目录 API）
+ *   - 文件系统操作:       lfs_mount/format/remove/stat...（对外 API）
+ *   - 后台整理(GC):       lfs_fs_pred/successor/relocate/forceconsistency
+ *
+ * 对外 API 一览（都带 lfs_ 前缀，参数中文说明见 lfs.h）：
+ *   挂载/格式化: lfs_mount / lfs_format
+ *   文件:        lfs_file_open/close/read/write/seek/sync/tell/size
+ *   目录:        lfs_mkdir/dir_open/dir_read/dir_remove/dir_close
+ *   其他:        lfs_rename/lfs_stat/lfs_remove/lfs_truncate
+ * ============================================================================
+ */
+/*
  * The little filesystem
  *
  * Copyright (c) 2022, The littlefs authors.

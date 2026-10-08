@@ -1,3 +1,8 @@
+<!--
+【中文导读】本文档是理解 littlefs 的钥匙：先通读本文（重点
+"Metadata pairs"双块轮换与 "Metadata log"两节），再进 lfs.c 源码。
+推荐对照阅读顺序：DESIGN.md → lfs.h → lfs.c。
+-->
 ## The design of littlefs
 
 A little fail-safe filesystem designed for microcontrollers.
