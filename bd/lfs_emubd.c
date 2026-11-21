@@ -1,4 +1,23 @@
 /*
+ * ============================================================================
+ * 【中文导读】lfs_emubd.c —— 高仿块设备实现
+ * ----------------------------------------------------------------------------
+ * 实现要点：
+ *   lfs_emubd_incblock/decblock/mutblock —— 引用计数 + COW 的块管理：
+ *     rc==1 可原地改；rc>1 必须先复制（快照共享块），这让
+ *     lfs_emubd_copy 只花 O(块数) 指针就能克隆整个盘。
+ *   prog：mutblock -> 坏块判定 -> 断言"目标必须是擦除态"（ erase_value
+ *     != -1 时逐字节检查，等价于真实 flash 的写前约束）-> 写入 ->
+ *     可选镜像到磁盘文件 -> 掉电注入。
+ *   erase：OOO 模式在此保存"第一笔写"（ooo_block/ooo_data），
+ *     磨损 +1，擦除值回填。
+ *   powerloss：回滚第一笔写 -> 调用户回调（longjmp/exit 均可）->
+ *     若继续运行再恢复，实现"掉电瞬间"的精确重放。
+ * 测试扩展 API（crc/bdcrc/wear/powercycles/copy...）供 test.py
+ *   断言盘状态与磨损分布。
+ * ============================================================================
+ */
+/*
  * Emulating block device, wraps filebd and rambd while providing a bunch
  * of hooks for testing littlefs in various conditions.
  *

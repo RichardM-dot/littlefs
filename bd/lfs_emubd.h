@@ -1,4 +1,23 @@
 /*
+ * ============================================================================
+ * 【中文导读】lfs_emubd —— 高仿块设备（官方测试体系的地基）
+ * ----------------------------------------------------------------------------
+ * 职责：在 RAM 上模拟一个"会磨损、会坏块、会掉电、会乱序"的 flash，
+ *   官方测试套件（tests/*.toml）全部跑在它上面。
+ * 核心能力（均由 lfs_emubd_config 配置）：
+ *   磨损统计 wear        —— 每次 erase +1，可设阈值
+ *   坏块行为 5 种        —— PROGERROR/ERASEERROR/READERROR/
+ *                           PROGNOOP/ERASENOOP（含"写不进去但静默成功"）
+ *   掉电注入 power_cycles —— 计数写操作次数触发 powerloss_cb
+ *   乱序写 OOO           —— 同一 sync 周期内第一次 erase 的块被
+ *                           回滚，模拟真实 flash 的乱序完成
+ *   读干扰延迟/统计       —— readed/proged/erased 计数 + nanosleep
+ * 块数据用引用计数 + 写时复制（lfs_emubd_mutblock），支撑
+ *   lfs_emubd_copy 做出任意多"平行宇宙"快照（分支跟踪用）。
+ * 想验证 littlefs 的掉电安全：power_cycles=1 反复跑就是官方做法。
+ * ============================================================================
+ */
+/*
  * Emulating block device, wraps filebd and rambd while providing a bunch
  * of hooks for testing littlefs in various conditions.
  *

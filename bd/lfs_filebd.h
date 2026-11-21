@@ -1,4 +1,17 @@
 /*
+ * ============================================================================
+ * 【中文导读】lfs_filebd —— POSIX 文件模拟块设备
+ * ----------------------------------------------------------------------------
+ * 职责：把一个普通文件当作 flash（lseek+read/write），适合在 PC 上
+ *   生成/检查 littlefs 磁盘镜像（littlefs-fuse 等工具链的基础）。
+ * 对外 API：lfs_filebd_create(cfg, path, bdcfg) 打开镜像文件，
+ *   read/prog 走 lseek+read/write，erase 为 no-op，
+ *   sync 调 fsync（Windows 用 FlushFileBuffers）——这是它比 rambd
+ *   真实的地方：数据真的要过 OS 页缓存。
+ * 数据流位置：lfs 缓存层 -> cfg 回调 -> 本文件 -> 镜像文件。
+ * ============================================================================
+ */
+/*
  * Block device emulated in a file
  *
  * Copyright (c) 2022, The littlefs authors.

@@ -1,4 +1,18 @@
 /*
+ * ============================================================================
+ * 【中文导读】lfs_rambd —— RAM 模拟块设备（最小移植参考实现）
+ * ----------------------------------------------------------------------------
+ * 职责：用一段 RAM buffer 完全模拟 flash 的读写语义，是学习/移植
+ *   littlefs 的"第一块垫脚石"：接口形态与真实 SPI Flash 驱动完全一致。
+ * 对外 API（作为 lfs_config 的 read/prog/erase/sync 注册）：
+ *   lfs_rambd_create/destroy   创建/销毁（分配 erase_size*erase_count 内存）
+ *   lfs_rambd_read/prog/erase/sync  四回调实现（erase/sync 是 no-op）
+ * 注意：prog 直接 memcpy，不校验"已擦除"；erase 为空操作——RAM 无需
+ *   模拟 1->0 语义，因此掉电安全在这里测不出来（要用 emubd）。
+ * 数据流位置：lfs_bd_read/prog(缓存层) -> cfg->read/prog -> 本文件 -> RAM。
+ * ============================================================================
+ */
+/*
  * Block device emulated in RAM
  *
  * Copyright (c) 2022, The littlefs authors.

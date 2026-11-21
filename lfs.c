@@ -56,6 +56,14 @@ enum {
 
 /// Caching block device operations ///
 
+/**
+ * @brief 作废一块读缓存（只把 block 标记为无效，不清 buffer 内容）
+ * @param  lfs    文件系统对象（未使用，保留接口一致性）
+ * @param  rcache 待作废的读缓存
+ * @note   不清零 buffer 是有意的：若缓存只读、或即将写入相同数据
+ *         （relocate 会把旧块原样搬进新块），保留旧内容反而省一次
+ *         预读与 memset，这是 littlefs 常见的"惰性失效"手法。
+ */
 static inline void lfs_cache_drop(lfs_t *lfs, lfs_cache_t *rcache) {
     // do not zero, cheaper if cache is readonly or only going to be
     // written with identical data (during relocates)
@@ -63,12 +71,28 @@ static inline void lfs_cache_drop(lfs_t *lfs, lfs_cache_t *rcache) {
     rcache->block = LFS_BLOCK_NULL;
 }
 
+/**
+ * @brief 清空一块程序缓存并标记无效
+ * @note  填 0xff 而不是 0：0xff 是 NOR flash 擦除后的默认值，未写满
+ *        的缓存尾字节与真实介质状态一致，同时避免把上一次文件的
+ *        残留数据泄漏进新文件（信息泄漏防护）。
+ */
 static inline void lfs_cache_zero(lfs_t *lfs, lfs_cache_t *pcache) {
     // zero to avoid information leak
     memset(pcache->buffer, 0xff, lfs->cfg->cache_size);
     pcache->block = LFS_BLOCK_NULL;
 }
 
+/**
+ * @brief 带双缓存的小块设备读：优先命中 pcache/rcache，未命中才落驱动
+ * @param  pcache 程序缓存（可为 NULL）；其中未冲刷的数据比盘上新，读时以它为准
+ * @param  rcache 读缓存；未命中时按 read_size 对齐整段预读填充
+ * @param  hint   提示本调用之后还要连续读多少字节，用于预读窗口 sizing
+ * @param  block/off/buffer/size 逻辑块号/块内偏移/目的缓冲/长度
+ * @return 0 成功；负错误码（驱动错误，或地址越界返回 LFS_ERR_CORRUPT）
+ * @note   littlefs 全部读路径（元数据、CTZ 文件数据）都经过这里，
+ *         是"用 RAM 换小 IO"的核心；单次调用 off+size 恒不跨块。
+ */
 static int lfs_bd_read(lfs_t *lfs,
         const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
         lfs_block_t block, lfs_off_t off,
@@ -116,6 +140,8 @@ static int lfs_bd_read(lfs_t *lfs,
             diff = lfs_min(diff, rcache->off-off);
         }
 
+        // 大块连续读（size>=hint 且对齐 read_size）直接绕过缓存落到驱动，
+        // 省一次 memcpy；hint 让顺序读的请求随消费速度逐渐"长大"
         if (size >= hint && off % lfs->cfg->read_size == 0 &&
                 size >= lfs->cfg->read_size) {
             // bypass cache?
@@ -132,6 +158,8 @@ static int lfs_bd_read(lfs_t *lfs,
             continue;
         }
 
+        // 预读窗口：起点向下对齐 read_size，终点按 off+hint 对齐后夹在
+        // block_size 与 cache_size 之间——一次 IO 尽量喂饱后续同块访问
         // load to cache, first condition can no longer fail
         LFS_ASSERT(!lfs->block_count || block < lfs->block_count);
         rcache->block = block;
@@ -153,6 +181,12 @@ static int lfs_bd_read(lfs_t *lfs,
     return 0;
 }
 
+/**
+ * @brief 逐字节比较"盘上内容"与"RAM 内容"（经缓存读出）
+ * @return LFS_CMP_EQ/LFS_CMP_LT/LFS_CMP_GT，或负错误码
+ * @note   两个用途：1) 写后回读校验（lfs_bd_flush 的 validate），发现
+ *         写入不粘即判坏块；2) lfs_dir_find_match 按文件名逐字节比对。
+ */
 static int lfs_bd_cmp(lfs_t *lfs,
         const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
         lfs_block_t block, lfs_off_t off,
@@ -180,6 +214,11 @@ static int lfs_bd_cmp(lfs_t *lfs,
     return LFS_CMP_EQ;
 }
 
+/**
+ * @brief 对盘上一段数据流式计算 CRC32（8 字节一段经缓存读出累加）
+ * @note  用于提交收尾回读校验与 fetchmatch 边扫边校验；配合 lfs_crc
+ *        实现 O(1) RAM 的校验，不整块缓冲。
+ */
 static int lfs_bd_crc(lfs_t *lfs,
         const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
         lfs_block_t block, lfs_off_t off, lfs_size_t size, uint32_t *crc) {
@@ -202,6 +241,12 @@ static int lfs_bd_crc(lfs_t *lfs,
 }
 
 #ifndef LFS_READONLY
+/**
+ * @brief 把 pcache 脏数据按 prog_size 对齐写出到驱动，可选回读校验
+ * @param  validate 为 true 时写完立即读回逐字节比对，不一致返回
+ *         LFS_ERR_CORRUPT——这是 littlefs 写路径上坏块的"第一现场"
+ * @return 0 成功；负错误码
+ */
 static int lfs_bd_flush(lfs_t *lfs,
         lfs_cache_t *pcache, lfs_cache_t *rcache, bool validate) {
     if (pcache->block != LFS_BLOCK_NULL && pcache->block != LFS_BLOCK_INLINE) {
@@ -214,6 +259,8 @@ static int lfs_bd_flush(lfs_t *lfs,
             return err;
         }
 
+        // 回读校验：写方手里本来就有 RAM 副本，所以一旦比对失败即可
+        // 断定块坏了，调用方 goto relocate 换一块重试，无需 ECC
         if (validate) {
             // check data on disk
             lfs_cache_drop(lfs, rcache);
@@ -237,6 +284,11 @@ static int lfs_bd_flush(lfs_t *lfs,
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 冲刷 pcache 并调用驱动 sync，把数据真正落到介质
+ * @note  掉电一致性窗口的物理边界就是它：元数据提交收尾与文件
+ *        sync 前都会走到这里，sync 返回后本次写才视为"已完成"。
+ */
 static int lfs_bd_sync(lfs_t *lfs,
         lfs_cache_t *pcache, lfs_cache_t *rcache, bool validate) {
     lfs_cache_drop(lfs, rcache);
@@ -253,6 +305,12 @@ static int lfs_bd_sync(lfs_t *lfs,
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 带缓存的块设备编程：先落 pcache，写满或换块时冲刷
+ * @note  flash 只能把 1 写成 0 且必须先擦除；本函数不校验目标区
+ *        是否处于擦除态（由调用方保证），validate=true 时冲刷阶段
+ *        会回读校验。
+ */
 static int lfs_bd_prog(lfs_t *lfs,
         lfs_cache_t *pcache, lfs_cache_t *rcache, bool validate,
         lfs_block_t block, lfs_off_t off,
@@ -275,6 +333,8 @@ static int lfs_bd_prog(lfs_t *lfs,
             size -= diff;
 
             pcache->size = lfs_max(pcache->size, off - pcache->off);
+            // pcache 写满立即冲刷：后续块可复用同一块缓存，同时把
+            // 坏块暴露的时机提前（而不是拖到 sync 才失败）
             if (pcache->size == lfs->cfg->cache_size) {
                 // eagerly flush out pcache if we fill up
                 int err = lfs_bd_flush(lfs, pcache, rcache, validate);
@@ -301,6 +361,11 @@ static int lfs_bd_prog(lfs_t *lfs,
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 擦除一个块（调用驱动 erase 回调），介质恢复为全 1 态
+ * @note  compact / ctz_extend / file_relocate 分得新块后第一步都是
+ *        它；返回 LFS_ERR_CORRUPT 时调用方换块重试（坏块回收路径）。
+ */
 static int lfs_bd_erase(lfs_t *lfs, lfs_block_t block) {
     LFS_ASSERT(block < lfs->block_count);
     int err = lfs->cfg->erase(lfs->cfg, block);
@@ -313,30 +378,48 @@ static int lfs_bd_erase(lfs_t *lfs, lfs_block_t block) {
 /// Small type-level utilities ///
 
 // some operations on paths
+/** @brief 当前路径段的长度（到下一个 '/' 为止） */
 static inline lfs_size_t lfs_path_namelen(const char *path) {
     return (lfs_size_t)strcspn(path, "/");
 }
 
+/**
+ * @brief 名字之后是否只剩斜杠（即已是路径最后一段）
+ * @note  lfs_dir_find 未命中时靠它区分"父目录在、末段不存在"（可创建）
+ *        与"父目录不存在"（直接 NOENT）两种情形。
+ */
 static inline bool lfs_path_islast(const char *path) {
     lfs_size_t namelen = lfs_path_namelen(path);
     return path[namelen + strspn(path + namelen, "/")] == '\0';
 }
 
+/** @brief 名字后是否还有下一段（路径以 '/' 结尾按目录语义处理） */
 static inline bool lfs_path_isdir(const char *path) {
     return path[lfs_path_namelen(path)] != '\0';
 }
 
 // operations on block pairs
+/**
+ * @brief 交换元数据对两块号的顺序
+ * @note  约定 pair[0] 恒为"最新提交所在块"：compact 把新块写到
+ *        pair[1] 再 swap 上位；fetchmatch 也把新块排到前面。
+ */
 static inline void lfs_pair_swap(lfs_block_t pair[2]) {
     lfs_block_t t = pair[0];
     pair[0] = pair[1];
     pair[1] = t;
 }
 
+/** @brief 对/尾指针是否为空（LFS_BLOCK_NULL=(lfs_block_t)-1；目录链终止条件） */
 static inline bool lfs_pair_isnull(const lfs_block_t pair[2]) {
     return pair[0] == LFS_BLOCK_NULL || pair[1] == LFS_BLOCK_NULL;
 }
 
+/**
+ * @brief 弱比较：两对中任一同位块号相等即认为同一对（返回 0）
+ * @note  元数据对两块在翻转/搬迁后顺序会变，比较必须无视顺序；
+ *        依赖块号全局唯一这一前提。
+ */
 static inline int lfs_pair_cmp(
         const lfs_block_t paira[2],
         const lfs_block_t pairb[2]) {
@@ -344,6 +427,11 @@ static inline int lfs_pair_cmp(
              paira[0] == pairb[1] || paira[1] == pairb[0]);
 }
 
+/**
+ * @brief 严格比较：块号集合与顺序都一致
+ * @note  deorphan 修复 half-orphan 时判断父目录指针是否已与链同步，
+ *        不同步才需要写修复提交。
+ */
 static inline bool lfs_pair_issync(
         const lfs_block_t paira[2],
         const lfs_block_t pairb[2]) {
@@ -351,12 +439,14 @@ static inline bool lfs_pair_issync(
            (paira[0] == pairb[1] && paira[1] == pairb[0]);
 }
 
+/** @brief 元数据对块号：盘上小端 -> 主机序（读盘后调用） */
 static inline void lfs_pair_fromle32(lfs_block_t pair[2]) {
     pair[0] = lfs_fromle32(pair[0]);
     pair[1] = lfs_fromle32(pair[1]);
 }
 
 #ifndef LFS_READONLY
+/** @brief 元数据对块号：主机序 -> 盘上小端（写盘前调用） */
 static inline void lfs_pair_tole32(lfs_block_t pair[2]) {
     pair[0] = lfs_tole32(pair[0]);
     pair[1] = lfs_tole32(pair[1]);
@@ -364,6 +454,12 @@ static inline void lfs_pair_tole32(lfs_block_t pair[2]) {
 #endif
 
 // operations on 32-bit entry tags
+// littlefs v2 用 32 位 tag 索引元数据块里的一切对象（文件名、结构、
+// 全局状态、CRC……）。布局：[valid 1 | type3 11 | id 10 | size 10]，
+// type3 再分 type1(3bit 抽象类) + chunk(8bit)。盘上 tag 以大端存储，
+// 且相邻 tag 互相 XOR（见 SPEC.md）；RAM 中统一使用 LFS_MKTAG 组装的
+// "明文 tag"，读写盘时才做 XOR 与端序转换。valid 位在 RAM 明文中
+// 恒为 0，最高位 0x80000000 另作他用（标记"数据在盘上"）。
 typedef uint32_t lfs_tag_t;
 typedef int32_t lfs_stag_t;
 
@@ -376,52 +472,73 @@ typedef int32_t lfs_stag_t;
 #define LFS_MKTAG_IF_ELSE(cond, type1, id1, size1, type2, id2, size2) \
     ((cond) ? LFS_MKTAG(type1, id1, size1) : LFS_MKTAG(type2, id2, size2))
 
+/** @brief valid 位为 0 才有效（盘上 tag 首位存的是反相 valid 位） */
 static inline bool lfs_tag_isvalid(lfs_tag_t tag) {
     return !(tag & 0x80000000);
 }
 
+/**
+ * @brief size 字段全 1（0x3ff）=> 删除标记
+ * @note  删除 tag 不携带数据；lfs_tag_dsize 里 tag+isdelete 的进位
+ *        技巧把 size 还原为 0，一行覆盖两种情形。
+ */
 static inline bool lfs_tag_isdelete(lfs_tag_t tag) {
     return ((int32_t)(tag << 22) >> 22) == -1;
 }
 
+// 3bit 抽象类型掩码：NAME/STRUCT/USERATTR/SPLICE/TAIL/GLOBALS/CRC 分类查找用
 static inline uint16_t lfs_tag_type1(lfs_tag_t tag) {
     return (tag & 0x70000000) >> 20;
 }
 
+// 4bit（type1+chunk 最高位）：CCRC/FCRC 等 CRC 族判定
 static inline uint16_t lfs_tag_type2(lfs_tag_t tag) {
     return (tag & 0x78000000) >> 20;
 }
 
+// 完整 11bit 类型：精确匹配某个具体 tag（如 0x202 CTZSTRUCT）
 static inline uint16_t lfs_tag_type3(lfs_tag_t tag) {
     return (tag & 0x7ff00000) >> 20;
 }
 
+// 8bit 子类型：文件类型(REG/DIR)、tail 类型、attr 类型、CRC 标志位等
 static inline uint8_t lfs_tag_chunk(lfs_tag_t tag) {
     return (tag & 0x0ff00000) >> 20;
 }
 
+// CREATE/DELETE(SPLICE 族) 携带的 id 平移量：chunk 直接当有符号数
 static inline int8_t lfs_tag_splice(lfs_tag_t tag) {
     return (int8_t)lfs_tag_chunk(tag);
 }
 
+// 所属文件 id；0x3ff 表示无 id 的全局条目（tail/gstate/crc）
 static inline uint16_t lfs_tag_id(lfs_tag_t tag) {
     return (tag & 0x000ffc00) >> 10;
 }
 
+// 数据长度；0x3ff 是删除标记（见 lfs_tag_isdelete）
 static inline lfs_size_t lfs_tag_size(lfs_tag_t tag) {
     return tag & 0x000003ff;
 }
 
+/**
+ * @brief tag 在盘上的总占位：4 字节头 + 数据（删除记 0）
+ * @note  tag+isdelete 的回绕：isdelete 时 size+1=0x400 截断回 0，
+ *        避免写分支，是典型的 branchless 技巧。
+ */
 static inline lfs_size_t lfs_tag_dsize(lfs_tag_t tag) {
     return sizeof(tag) + lfs_tag_size(tag + lfs_tag_isdelete(tag));
 }
 
 // operations on attributes in attribute lists
+// 提交时的"待写属性"：tag+buffer 成对，一次 commit 可写多条；
+// LFS_MKATTRS(...) 用复合字面量把 {...} 语法糖展开成数组+个数
 struct lfs_mattr {
     lfs_tag_t tag;
     const void *buffer;
 };
 
+// tag 数据在盘上的位置：数据可以不搬进 RAM，原地引用（move 场景）
 struct lfs_diskoff {
     lfs_block_t block;
     lfs_off_t off;
@@ -432,12 +549,18 @@ struct lfs_diskoff {
     sizeof((struct lfs_mattr[]){__VA_ARGS__}) / sizeof(struct lfs_mattr)
 
 // operations on global state
+/**
+ * @brief 全局状态 = 各元数据对上 delta 的 XOR 和（DESIGN.md "global state"）
+ * @note  任何对提交 MOVESTATE 都能"翻转"全局状态；挂载时把链上全部
+ *        gstate xor 起来即还原真实状态。这是跨元数据对原子性的基石。
+ */
 static inline void lfs_gstate_xor(lfs_gstate_t *a, const lfs_gstate_t *b) {
     a->tag ^= b->tag;
     a->pair[0] ^= b->pair[0];
     a->pair[1] ^= b->pair[1];
 }
 
+/** @brief 全 0 = 无待处理状态（无孤儿、无 move、超块已最新） */
 static inline bool lfs_gstate_iszero(const lfs_gstate_t *a) {
     return a->tag == 0
             && a->pair[0] == 0
@@ -445,28 +568,34 @@ static inline bool lfs_gstate_iszero(const lfs_gstate_t *a) {
 }
 
 #ifndef LFS_READONLY
+/** @brief size 字段低 9 位作孤儿计数（mkdir/remove 时 +1/-1 流水账） */
 static inline bool lfs_gstate_hasorphans(const lfs_gstate_t *a) {
     return lfs_tag_size(a->tag);
 }
 
+/** @brief 取孤儿计数值（deorphan 收尾时 -n 一次清零） */
 static inline uint8_t lfs_gstate_getorphans(const lfs_gstate_t *a) {
     return lfs_tag_size(a->tag) & 0x1ff;
 }
 
+/** @brief type1 非 0 => 有未完成 move（跨目录原子搬移的中间态） */
 static inline bool lfs_gstate_hasmove(const lfs_gstate_t *a) {
     return lfs_tag_type1(a->tag);
 }
 #endif
 
+/** @brief size bit9：挂载到旧次版本盘，首次写前需重写超块 */
 static inline bool lfs_gstate_needssuperblock(const lfs_gstate_t *a) {
     return lfs_tag_size(a->tag) >> 9;
 }
 
+/** @brief move 源是否就是该元数据对（读路径也要"看见"未完成 move） */
 static inline bool lfs_gstate_hasmovehere(const lfs_gstate_t *a,
         const lfs_block_t *pair) {
     return lfs_tag_type1(a->tag) && lfs_pair_cmp(a->pair, pair) == 0;
 }
 
+/** @brief gstate 三字段端序转换（MOVESTATE 在盘上按小端存） */
 static inline void lfs_gstate_fromle32(lfs_gstate_t *a) {
     a->tag     = lfs_fromle32(a->tag);
     a->pair[0] = lfs_fromle32(a->pair[0]);
@@ -474,6 +603,7 @@ static inline void lfs_gstate_fromle32(lfs_gstate_t *a) {
 }
 
 #ifndef LFS_READONLY
+/** @brief gstate 三字段端序转换（写盘方向） */
 static inline void lfs_gstate_tole32(lfs_gstate_t *a) {
     a->tag     = lfs_tole32(a->tag);
     a->pair[0] = lfs_tole32(a->pair[0]);
@@ -482,17 +612,25 @@ static inline void lfs_gstate_tole32(lfs_gstate_t *a) {
 #endif
 
 // operations on forward-CRCs used to track erased state
+/**
+ * @brief FCRC 载荷：下一 program 窗口"擦除态"的校验（lfs2.1 新增）
+ * @note  掉电可能把下一次提交写了一半，仅凭 valid 位无法确认其后
+ *        字节仍是擦除态；FCRC 记录擦除态的 CRC，fetch 时比对即可
+ *        判定"下一提交区域是否干净"，避免不必要的整块重擦。
+ */
 struct lfs_fcrc {
     lfs_size_t size;
     uint32_t crc;
 };
 
+/** @brief FCRC 载荷端序转换（读盘） */
 static void lfs_fcrc_fromle32(struct lfs_fcrc *fcrc) {
     fcrc->size = lfs_fromle32(fcrc->size);
     fcrc->crc = lfs_fromle32(fcrc->crc);
 }
 
 #ifndef LFS_READONLY
+/** @brief FCRC 载荷端序转换（写盘） */
 static void lfs_fcrc_tole32(struct lfs_fcrc *fcrc) {
     fcrc->size = lfs_tole32(fcrc->size);
     fcrc->crc = lfs_tole32(fcrc->crc);
@@ -500,18 +638,21 @@ static void lfs_fcrc_tole32(struct lfs_fcrc *fcrc) {
 #endif
 
 // other endianness operations
+/** @brief CTZ 跳表头 {head 块号, 文件大小} 端序转换（读盘） */
 static void lfs_ctz_fromle32(struct lfs_ctz *ctz) {
     ctz->head = lfs_fromle32(ctz->head);
     ctz->size = lfs_fromle32(ctz->size);
 }
 
 #ifndef LFS_READONLY
+/** @brief CTZ 跳表头端序转换（写盘） */
 static void lfs_ctz_tole32(struct lfs_ctz *ctz) {
     ctz->head = lfs_tole32(ctz->head);
     ctz->size = lfs_tole32(ctz->size);
 }
 #endif
 
+/** @brief 超块配置字段端序转换（version/block_size/block_count/...） */
 static inline void lfs_superblock_fromle32(lfs_superblock_t *superblock) {
     superblock->version     = lfs_fromle32(superblock->version);
     superblock->block_size  = lfs_fromle32(superblock->block_size);
@@ -522,6 +663,7 @@ static inline void lfs_superblock_fromle32(lfs_superblock_t *superblock) {
 }
 
 #ifndef LFS_READONLY
+/** @brief 超块配置字段端序转换（写盘方向） */
 static inline void lfs_superblock_tole32(lfs_superblock_t *superblock) {
     superblock->version     = lfs_tole32(superblock->version);
     superblock->block_size  = lfs_tole32(superblock->block_size);
@@ -533,6 +675,9 @@ static inline void lfs_superblock_tole32(lfs_superblock_t *superblock) {
 #endif
 
 #ifndef LFS_NO_ASSERT
+/**
+ * @brief 调试断言用：file/dir 是否已在打开链表上（防重复打开/未开先关）
+ */
 static bool lfs_mlist_isopen(struct lfs_mlist *head,
         struct lfs_mlist *node) {
     for (struct lfs_mlist **p = &head; *p; p = &(*p)->next) {
@@ -545,6 +690,11 @@ static bool lfs_mlist_isopen(struct lfs_mlist *head,
 }
 #endif
 
+/**
+ * @brief 从 lfs->mlist（当前打开的 file/dir 链）摘除一个节点
+ * @note  mlist 的意义：句柄打开期间，其它提交可能移动/删除同一条目，
+ *        relocatingcommit 的 fixmlist 借此把受影响句柄的 id/pair 同步修正。
+ */
 static void lfs_mlist_remove(lfs_t *lfs, struct lfs_mlist *mlist) {
     for (struct lfs_mlist **p = &lfs->mlist; *p; p = &(*p)->next) {
         if (*p == mlist) {
@@ -554,12 +704,16 @@ static void lfs_mlist_remove(lfs_t *lfs, struct lfs_mlist *mlist) {
     }
 }
 
+/** @brief 头插进 mlist（O(1)）；打开 file/dir 时必须登记 */
 static void lfs_mlist_append(lfs_t *lfs, struct lfs_mlist *mlist) {
     mlist->next = lfs->mlist;
     lfs->mlist = mlist;
 }
 
 // some other filesystem operations
+/**
+ * @brief 本次使用的盘上格式版本（LFS_MULTIVERSION 时可指定写旧版）
+ */
 static uint32_t lfs_fs_disk_version(lfs_t *lfs) {
     (void)lfs;
 #ifdef LFS_MULTIVERSION
@@ -572,11 +726,13 @@ static uint32_t lfs_fs_disk_version(lfs_t *lfs) {
     }
 }
 
+/** @brief 盘上版本主版本号（不兼容变更才递增） */
 static uint16_t lfs_fs_disk_version_major(lfs_t *lfs) {
     return 0xffff & (lfs_fs_disk_version(lfs) >> 16);
 
 }
 
+/** @brief 盘上版本次版本号（可向后兼容） */
 static uint16_t lfs_fs_disk_version_minor(lfs_t *lfs) {
     return 0xffff & (lfs_fs_disk_version(lfs) >> 0);
 }
@@ -639,12 +795,22 @@ static int lfs_unmount_(lfs_t *lfs);
 // the filesystem
 //
 // after a checkpoint, the block allocator may realloc any untracked blocks
+/**
+ * @brief 记"无在途分配"检查点：ckpoint = 剩余可扫描块数
+ * @note  一批分配开始前调用；当扫描覆盖了自检查点以来的全部块仍
+ *        找不到空闲块，才能断定盘真的满了（而不是分配器视角暂缺）。
+ */
 static void lfs_alloc_ckpoint(lfs_t *lfs) {
     lfs->lookahead.ckpoint = lfs->block_count;
 }
 
 // drop the lookahead buffer, this is done during mounting and failed
 // traversals in order to avoid invalid lookahead state
+/**
+ * @brief 清空 lookahead 窗口
+ * @note  挂载后（起始点要按 seed 随机化）与全盘遍历失败时调用，
+ *        防止拿过期的空闲位图继续分配。
+ */
 static void lfs_alloc_drop(lfs_t *lfs) {
     lfs->lookahead.size = 0;
     lfs->lookahead.next = 0;
@@ -652,6 +818,10 @@ static void lfs_alloc_drop(lfs_t *lfs) {
 }
 
 #ifndef LFS_READONLY
+/**
+ * @brief lfs_fs_traverse_ 回调：把在用块标记进 lookahead 位图
+ * @note  bit=1 表示占用；窗口外的块不标记，等下次窗口移动再覆盖。
+ */
 static int lfs_alloc_lookahead(void *p, lfs_block_t block) {
     lfs_t *lfs = (lfs_t*)p;
     lfs_block_t off = ((block - lfs->lookahead.start)
@@ -666,14 +836,24 @@ static int lfs_alloc_lookahead(void *p, lfs_block_t block) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 全盘扫描在用块，重建 lookahead 空闲窗口
+ * @note  每次扫描窗口起点沿上次分配位置绕圈推进，叠加挂载时的
+ *        随机起点，使分配位置在盘上均匀分布——这就是 littlefs 的
+ *        动态磨损均衡（无静态搬块，纯概率摊平）。
+ */
 static int lfs_alloc_scan(lfs_t *lfs) {
     // move lookahead buffer to the first unused block
     //
     // note we limit the lookahead buffer to at most the amount of blocks
     // checkpointed, this prevents the math in lfs_alloc from underflowing
+    // 窗口起点沿上次分配位置继续绕圈，避免每次都从块 0 开始
+    // 造成低块号先磨损
     lfs->lookahead.start = (lfs->lookahead.start + lfs->lookahead.next) 
             % lfs->block_count;
     lfs->lookahead.next = 0;
+    // 窗口上限受 ckpoint 钳制：已计入"剩余余量"的块不能重复计入，
+    // 否则 lfs_alloc 的满盘判定会下溢
     lfs->lookahead.size = lfs_min(
             8*lfs->cfg->lookahead_size,
             lfs->lookahead.ckpoint);
@@ -691,6 +871,14 @@ static int lfs_alloc_scan(lfs_t *lfs) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 分配一个空闲块：先查 lookahead 位图，空了就全盘再扫
+ * @param  block 输出分配到的块号
+ * @return 0 成功；LFS_ERR_NOSPC 所有块都在用（含坏块耗尽）
+ * @note   littlefs 不维护盘上空闲链表——"盘上无引用的块即空闲"，
+ *         分配器像脚本语言的 GC 一样按需扫描；命中后还会顺带把
+ *         next 推进到下一个空闲位，摊薄后续分配的循环开销。
+ */
 static int lfs_alloc(lfs_t *lfs, lfs_block_t *block) {
     while (true) {
         // scan our lookahead buffer for free blocks
@@ -701,6 +889,8 @@ static int lfs_alloc(lfs_t *lfs, lfs_block_t *block) {
                 *block = (lfs->lookahead.start + lfs->lookahead.next)
                         % lfs->block_count;
 
+                // 命中后继续快进到下一个空闲位：下次分配 O(1)，
+                // 同时消耗 ckpoint 余量
                 // eagerly find next free block to maximize how many blocks
                 // lfs_alloc_ckpoint makes available for scanning
                 while (true) {
@@ -726,6 +916,8 @@ static int lfs_alloc(lfs_t *lfs, lfs_block_t *block) {
         // If we've looked at all blocks since the last checkpoint, we report
         // the filesystem as out of storage.
         //
+        // 自上次 ckpoint 起已看遍所有块仍无空闲 => 真满盘（含坏块），
+        // 返回 NOSPC 而不是死循环；这是满盘判定的唯一出口
         if (lfs->lookahead.ckpoint <= 0) {
             LFS_ERROR("No more free space 0x%"PRIx32,
                     (lfs->lookahead.start + lfs->lookahead.next)
@@ -744,6 +936,16 @@ static int lfs_alloc(lfs_t *lfs, lfs_block_t *block) {
 #endif
 
 /// Metadata pair and directory operations ///
+/**
+ * @brief 在元数据块上反向扫描 tag 链，找到 gmask/gtag 匹配的最新条目
+ * @param  gmask  匹配掩码（哪些位参与比较）
+ * @param  gtag   期望 tag（id 字段为要查的文件 id）
+ * @param  goff/gbuffer/gsize 数据切片偏移/缓冲/长度（支持分片读）
+ * @return 命中的 tag（id 已按 splice 修正）；LFS_ERR_NOENT 未命中
+ * @note   从 dir->off 往回走（反向迭代）：最新提交在日志尾部，命中
+ *         第一个即最新版本；gdiff 累计 CREATE/DELETE 对 id 的搬移，
+ *         把"查询时刻的 id"映射回"当前日志里的 id"。
+ */
 static lfs_stag_t lfs_dir_getslice(lfs_t *lfs, const lfs_mdir_t *dir,
         lfs_tag_t gmask, lfs_tag_t gtag,
         lfs_off_t goff, void *gbuffer, lfs_size_t gsize) {
@@ -751,6 +953,8 @@ static lfs_stag_t lfs_dir_getslice(lfs_t *lfs, const lfs_mdir_t *dir,
     lfs_tag_t ntag = dir->etag;
     lfs_stag_t gdiff = 0;
 
+    // 合成 move：gdisk 记录挂载时发现的未完成 move，读路径要让源
+    // 条目"看起来已被移走"（id 相同=>NOENT，更大=>平移 -1）
     // synthetic moves
     if (lfs_gstate_hasmovehere(&lfs->gdisk, dir->pair) &&
             lfs_tag_id(gmask) != 0) {
@@ -761,6 +965,7 @@ static lfs_stag_t lfs_dir_getslice(lfs_t *lfs, const lfs_mdir_t *dir,
         }
     }
 
+    // 从日志尾部向前扫：第一个匹配即最新版本，平均省一半扫描
     // iterate over dir block backwards (for faster lookups)
     while (off >= sizeof(lfs_tag_t) + lfs_tag_dsize(ntag)) {
         off -= lfs_tag_dsize(ntag);
@@ -773,6 +978,8 @@ static lfs_stag_t lfs_dir_getslice(lfs_t *lfs, const lfs_mdir_t *dir,
             return err;
         }
 
+    // 盘上 tag 为大端且与前一 tag XOR 成链：这里还原明文；
+    // &0x7fffffff 把 valid 位归一（valid 语义由调用方按约定处理）
         ntag = (lfs_frombe32(ntag) ^ tag) & 0x7fffffff;
 
         if (lfs_tag_id(gmask) != 0 &&
@@ -811,6 +1018,7 @@ static lfs_stag_t lfs_dir_getslice(lfs_t *lfs, const lfs_mdir_t *dir,
     return LFS_ERR_NOENT;
 }
 
+/** @brief lfs_dir_getslice 的整段读封装（goff=0，长度=tag.size） */
 static lfs_stag_t lfs_dir_get(lfs_t *lfs, const lfs_mdir_t *dir,
         lfs_tag_t gmask, lfs_tag_t gtag, void *buffer) {
     return lfs_dir_getslice(lfs, dir,
@@ -818,6 +1026,11 @@ static lfs_stag_t lfs_dir_get(lfs_t *lfs, const lfs_mdir_t *dir,
             0, buffer, lfs_tag_size(gtag));
 }
 
+/**
+ * @brief 把 inline 文件（数据嵌在元数据对里的文件）当块设备来读
+ * @note  inline 文件没有独立块号，读它=按 INLINESTRUCT tag 从元数据
+ *        对里切片；用 LFS_BLOCK_INLINE 哨兵复用普通缓存的命中逻辑。
+ */
 static int lfs_dir_getread(lfs_t *lfs, const lfs_mdir_t *dir,
         const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
         lfs_tag_t gmask, lfs_tag_t gtag,
@@ -877,6 +1090,12 @@ static int lfs_dir_getread(lfs_t *lfs, const lfs_mdir_t *dir,
 }
 
 #ifndef LFS_READONLY
+/**
+ * @brief traverse 的过滤器回调：剔除将被覆盖的旧 tag
+ * @note  compact 挑"最新版本"的核心：同 id 同类型的旧 tag 被丢弃；
+ *        DELETE 之后没有更新版本的条目整条消失。命中即返回 true
+ *        停止下钻（filtertag 置 NOOP 使后续全部通过）。
+ */
 static int lfs_dir_traverse_filter(void *p,
         lfs_tag_t tag, const void *buffer) {
     lfs_tag_t *filtertag = p;
@@ -937,6 +1156,17 @@ struct lfs_dir_traverse {
     struct lfs_diskoff disk;
 };
 
+/**
+ * @brief 元数据提交的统一迭代器：串起盘上旧提交、待写 attrs、move 源
+ * @param  tmask/ttag 只处理 (tmask&tag)==(tmask&ttag) 的 tag（0 表示全收）
+ * @param  begin/end  id 过滤窗口 [begin,end)；diff 为 id 的整体平移
+ * @param  cb/data    每个命中 tag 的回调（写 commit / 统计大小）
+ * @return 0 遍历完成；回调返回正数提前终止；负错误码
+ * @note   逻辑上是三层递归（commit→filter→move），这里用显式栈手工
+ *         展开成 O(1) 栈深，保证 RAM 有界——littlefs 禁止无界递归。
+ *         FROM_MOVE 分支"跳"进源目录，把待搬 id 的 tag 一并收割，
+ *         实现 rename/move 的原子提交。
+ */
 static int lfs_dir_traverse(lfs_t *lfs,
         const lfs_mdir_t *dir, lfs_off_t off, lfs_tag_t ptag,
         const struct lfs_mattr *attrs, int attrcount,
@@ -1132,6 +1362,17 @@ popped:
 }
 #endif
 
+/**
+ * @brief 元数据对读取核心：选最新块、扫全部提交、顺带匹配目标 tag
+ * @param  fmask/ftag 匹配掩码与目标（(lfs_tag_t)-1 表示纯 fetch 不匹配）
+ * @param  cb/data    匹配回调（如按名字逐字节比对），返回 LFS_CMP_*
+ * @param  id         输出：目标所在的 id（min(bestid,count)，供插入用）
+ * @return 命中 tag；0=条目不存在但 id 合法；LFS_ERR_NOENT id 越界；
+ *         LFS_ERR_CORRUPT 两块都读不出有效提交
+ * @note   双块裁决靠 revision count 的序列比较（lfs_scmp 处理回绕）；
+ *         每条提交边扫边 CRC，遇 CRC tag 时校验，并把 chunk 最低位
+ *         折进下一提交的 valid 位——"半写提交被识别"的全部机制在此。
+ */
 static lfs_stag_t lfs_dir_fetchmatch(lfs_t *lfs,
         lfs_mdir_t *dir, const lfs_block_t pair[2],
         lfs_tag_t fmask, lfs_tag_t ftag, uint16_t *id,
@@ -1159,6 +1400,8 @@ static lfs_stag_t lfs_dir_fetchmatch(lfs_t *lfs,
             return err;
         }
 
+        // 序列号比较：rev 回绕时仍能判出新旧（RFC1982 语义），
+        // rev 大者排到 pair[0]
         if (err != LFS_ERR_CORRUPT &&
                 lfs_scmp(revs[i], revs[(i+1)%2]) > 0) {
             r = i;
@@ -1237,9 +1480,14 @@ static lfs_stag_t lfs_dir_fetchmatch(lfs_t *lfs,
                     break;
                 }
 
+                // CRC tag 的 chunk bit0 约定下一提交 valid 位应取反：
+                // 未写区域全 0xff 解出的 tag valid 位必然不符 => 判无效，
+                // 半写提交到此被拦下（配合 FCRC 更精确，见下）
                 // reset the next bit if we need to
                 ptag ^= (lfs_tag_t)(lfs_tag_chunk(tag) & 1U) << 31;
 
+                // 把每个提交的 CRC 摘进 seed：这是跨掉电稳定的"熵源"，
+                // 挂载后据此随机化分配起点（动态磨损均衡的种子）
                 // toss our crc into the filesystem seed for
                 // pseudorandom numbers, note we use another crc here
                 // as a collection function because it is sufficiently
@@ -1353,6 +1601,9 @@ static lfs_stag_t lfs_dir_fetchmatch(lfs_t *lfs,
             continue;
         }
 
+        // 尾提交完整且 off 对齐 prog_size 才可能"仍处于擦除态"；
+        // lfs2.1 用 FCRC 复核下一窗口，lfs2.0 盘无 FCRC 直接视为已擦除
+        //（否则对 2.0 盘的追加写会退化成每次都重擦）
         // did we end on a valid commit? we may have an erased block
         dir->erased = false;
         if (maybeerased && dir->off % lfs->cfg->prog_size == 0) {
@@ -1384,6 +1635,8 @@ static lfs_stag_t lfs_dir_fetchmatch(lfs_t *lfs,
             }
         }
 
+        // 合成 move：gdisk 的 move 源在本对时按 move id 修正查询结果
+        //（与 getslice 开头的处理对偶，覆盖"扫全块"这条路径）
         // synthetic move
         if (lfs_gstate_hasmovehere(&lfs->gdisk, dir->pair)) {
             if (lfs_tag_id(lfs->gdisk.tag) == lfs_tag_id(besttag)) {
@@ -1413,6 +1666,11 @@ static lfs_stag_t lfs_dir_fetchmatch(lfs_t *lfs,
     return LFS_ERR_CORRUPT;
 }
 
+/**
+ * @brief 把元数据对刷新到最新状态（不匹配任何特定 tag）
+ * @note  mask/tag 全 1 因 valid 位恒为 1 而永不可能命中，
+ *        巧妙复用 fetchmatch 做纯 fetch。
+ */
 static int lfs_dir_fetch(lfs_t *lfs,
         lfs_mdir_t *dir, const lfs_block_t pair[2]) {
     // note, mask=-1, tag=-1 can never match a tag since this
@@ -1421,6 +1679,11 @@ static int lfs_dir_fetch(lfs_t *lfs,
             (lfs_tag_t)-1, (lfs_tag_t)-1, NULL, NULL, NULL);
 }
 
+/**
+ * @brief 读出该对携带的 MOVESTATE delta 并 xor 进 gstate
+ * @note  挂载时对链上每对调用（聚合出全局状态）；compact 时也用它
+ *        把 delta 搬到新块——delta 不能丢，否则 move/孤儿状态丢失。
+ */
 static int lfs_dir_getgstate(lfs_t *lfs, const lfs_mdir_t *dir,
         lfs_gstate_t *gstate) {
     lfs_gstate_t temp;
@@ -1439,6 +1702,11 @@ static int lfs_dir_getgstate(lfs_t *lfs, const lfs_mdir_t *dir,
     return 0;
 }
 
+/**
+ * @brief 填充 lfs_info：type/name/size（root 特判为 "/"）
+ * @note  size 来源：CTZSTRUCT 读 ctz.size；INLINESTRUCT 即 tag.size
+ *        （数据本身嵌在元数据对里，长度就是 tag 的 size 字段）。
+ */
 static int lfs_dir_getinfo(lfs_t *lfs, lfs_mdir_t *dir,
         uint16_t id, struct lfs_info *info) {
     if (id == 0x3ff) {
@@ -1479,6 +1747,11 @@ struct lfs_dir_find_match {
     lfs_size_t size;
 };
 
+/**
+ * @brief 按名字逐字节比较盘上的 name tag（fetchmatch 的回调）
+ * @return LFS_CMP_EQ 名字完全一致；LT/GT 供 fetchmatch 维护
+ *         字典序插入位置（tempbesttag）
+ */
 static int lfs_dir_find_match(void *data,
         lfs_tag_t tag, const void *buffer) {
     struct lfs_dir_find_match *name = data;
@@ -1509,6 +1782,15 @@ static int lfs_dir_find_match(void *data,
 // - 0                  if file is found
 // - LFS_ERR_NOENT      if file or parent is not found
 // - LFS_ERR_NOTDIR     if parent is not a dir
+/**
+ * @brief 路径解析：逐段下钻目录树，定位最终条目
+ * @param  path 输入完整路径；返回时指向"最后一段"（便于创建新条目）
+ * @param  id   输出最后一段的命中/插入 id
+ * @return 命中 tag；LFS_ERR_NOENT 文件或父目录不存在；
+ *         LFS_ERR_NOTDIR 中途遇到文件；'.' 与可消化的 '..' 已就地处理
+ * @note   每段用 fetchmatch(name) 找条目；目录跨块时沿 hardtail 继续
+ *         （字典序分家保证）；'..' 只允许成对消化、不允许越根。
+ */
 static lfs_stag_t lfs_dir_find(lfs_t *lfs, lfs_mdir_t *dir,
         const char **path, uint16_t *id) {
     // we reduce path to a single name if we can find it
@@ -1619,6 +1901,8 @@ nextname:
 }
 
 // commit logic
+// 一次提交的游标状态：block/off 写入位置，ptag 上一条 tag（XOR 链），
+// crc 运行校验，begin/end 日志可用区间（end 预留 8 字节给收尾 CRC）
 struct lfs_commit {
     lfs_block_t block;
     lfs_off_t off;
@@ -1630,6 +1914,9 @@ struct lfs_commit {
 };
 
 #ifndef LFS_READONLY
+/**
+ * @brief 提交的最小写单元：写出一段数据并同步累进 CRC 与偏移
+ */
 static int lfs_dir_commitprog(lfs_t *lfs, struct lfs_commit *commit,
         const void *buffer, lfs_size_t size) {
     int err = lfs_bd_prog(lfs,
@@ -1647,6 +1934,12 @@ static int lfs_dir_commitprog(lfs_t *lfs, struct lfs_commit *commit,
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 写出一条 tag+数据（tag 大端、与前 tag XOR；数据可来自 RAM 或盘）
+ * @note  tag 高位 0x80000000 表示 buffer 实为 struct lfs_diskoff——
+ *        move 源数据直接盘到盘搬运不占 RAM（逐字节循环靠缓存提速）。
+ *        空间不足返回 LFS_ERR_NOSPC，触发上层 compact。
+ */
 static int lfs_dir_commitattr(lfs_t *lfs, struct lfs_commit *commit,
         lfs_tag_t tag, const void *buffer) {
     // check if we fit
@@ -1695,6 +1988,15 @@ static int lfs_dir_commitattr(lfs_t *lfs, struct lfs_commit *commit,
 
 #ifndef LFS_READONLY
 
+/**
+ * @brief 收尾一次提交：对齐 prog_size、写 CRC tag、回读验证
+ * @note  两种形态：块中部=5 词 CRC+FCRC（顺带校验下一窗口擦除态）；
+ *        块尾=2 词 CRC（无后续写）。padding 不计入 CRC，所以收尾
+ *        校验分两段：非 padding 区比对已知 CRC + 单独验证 CRC 字段
+ *        自身为 0（CRC(crc)==0 自校验），防止拣到无关旧提交。
+ *        eperturb 技巧：若下一窗口首字节与擦除值相同会"写不动"，
+ *        翻转 valid 位强制下个提交判无效，保证状态机不卡死。
+ */
 static int lfs_dir_commitcrc(lfs_t *lfs, struct lfs_commit *commit) {
     // align to program units
     //
@@ -1708,6 +2010,8 @@ static int lfs_dir_commitcrc(lfs_t *lfs, struct lfs_commit *commit) {
     lfs_off_t off1 = 0;
     uint32_t crc1 = 0;
 
+    // padding 不参与 CRC：fetch 扫描时可直接跳过它，但这使收尾
+    // 校验必须分两段进行（见函数尾）
     // create crc tags to fill up remainder of commit, note that
     // padding is not crced, which lets fetches skip padding but
     // makes committing a bit more complicated
@@ -1720,6 +2024,8 @@ static int lfs_dir_commitcrc(lfs_t *lfs, struct lfs_commit *commit) {
             noff = lfs_min(noff, end - 5*sizeof(uint32_t));
         }
 
+        // 需要 FCRC？先窥探下一 prog 窗口首字节：全 0xff 无需扰动；
+        // 否则用 CRC tag 的 valid 位扰动，绕开"写不动"的死锁
         // space for fcrc?
         uint8_t eperturb = (uint8_t)-1;
         if (noff >= end && noff <= lfs->cfg->block_size - lfs->cfg->prog_size) {
@@ -1782,6 +2088,7 @@ static int lfs_dir_commitcrc(lfs_t *lfs, struct lfs_commit *commit) {
             return err;
         }
 
+        // 记录第一条非 padding CRC 的位置与值，收尾回读比对用
         // keep track of non-padding checksum to verify
         if (off1 == 0) {
             off1 = commit->off + sizeof(lfs_tag_t);
@@ -1805,6 +2112,8 @@ static int lfs_dir_commitcrc(lfs_t *lfs, struct lfs_commit *commit) {
         }
     }
 
+    // 提交完成前回读校验：对不上说明该块大概率要坏，上层走
+    // relocate 换块重写（数据还在 RAM，零损失）
     // successful commit, check checksums to make sure
     //
     // note that we don't need to check padding commits, worst
@@ -1841,6 +2150,12 @@ static int lfs_dir_commitcrc(lfs_t *lfs, struct lfs_commit *commit) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 为新元数据对分配两个块并初始化 RAM 状态（不写盘）
+ * @note  逆序分配（先 pair[1] 后 pair[0]）：万一第二个分配失败，
+ *        已分配块仍是干净空闲块，不留半初始化状态；rev 对齐
+ *        (block_cycles+1)|1 让新对不会立刻踩到磨损搬迁点。
+ */
 static int lfs_dir_alloc(lfs_t *lfs, lfs_mdir_t *dir) {
     // allocate pair of dir blocks (backwards, so we write block 1 first)
     for (int i = 0; i < 2; i++) {
@@ -1863,6 +2178,8 @@ static int lfs_dir_alloc(lfs_t *lfs, lfs_mdir_t *dir) {
         return err;
     }
 
+    // rev 对齐到搬迁模数：防止"刚分配就到达搬迁点"造成
+    // 分配→立即重写的空转
     // to make sure we don't immediately evict, align the new revision count
     // to our block_cycles modulus, see lfs_dir_compact for why our modulus
     // is tweaked this way
@@ -1885,6 +2202,11 @@ static int lfs_dir_alloc(lfs_t *lfs, lfs_mdir_t *dir) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 摘除空的尾元数据对：把它的 tail（和 gstate delta）并回前一对
+ * @note  remove/rename 删空目录后目录链要收缩一格；先偷走 gdelta
+ *        再改 tail，一次 commit 完成；中途掉电由 deorphan 兜底。
+ */
 static int lfs_dir_drop(lfs_t *lfs, lfs_mdir_t *dir, lfs_mdir_t *tail) {
     // steal state
     int err = lfs_dir_getgstate(lfs, tail, &lfs->gdelta);
@@ -1906,6 +2228,11 @@ static int lfs_dir_drop(lfs_t *lfs, lfs_mdir_t *dir, lfs_mdir_t *tail) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 把 [split,end) 的条目搬到新元数据对，本对保留 [begin,split)
+ * @note  元数据对超过约 50% 就分家——日志式存储摊销 O(1) 的关键；
+ *        root 分家时 root 指针跟到新尾部（超块链自然生长）。
+ */
 static int lfs_dir_split(lfs_t *lfs,
         lfs_mdir_t *dir, const struct lfs_mattr *attrs, int attrcount,
         lfs_mdir_t *source, uint16_t split, uint16_t end) {
@@ -1941,6 +2268,7 @@ static int lfs_dir_split(lfs_t *lfs,
 #endif
 
 #ifndef LFS_READONLY
+/** @brief traverse 回调：累计 [begin,end) 条目的盘上字节数（分家决策用） */
 static int lfs_dir_commit_size(void *p, lfs_tag_t tag, const void *buffer) {
     lfs_size_t *size = p;
     (void)buffer;
@@ -1958,6 +2286,7 @@ struct lfs_dir_commit_commit {
 #endif
 
 #ifndef LFS_READONLY
+/** @brief traverse 回调：把每个 tag 交给 lfs_dir_commitattr 写出 */
 static int lfs_dir_commit_commit(void *p, lfs_tag_t tag, const void *buffer) {
     struct lfs_dir_commit_commit *commit = p;
     return lfs_dir_commitattr(commit->lfs, commit->commit, tag, buffer);
@@ -1978,6 +2307,16 @@ static bool lfs_dir_needsrelocation(lfs_t *lfs, lfs_mdir_t *dir) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 压缩重写元数据对：擦 pair[1]→写 rev→全量条目→tail→gstate→CRC
+ * @param  source 条目来源（通常为当前对；分家时为原对）
+ * @param  begin/end 只搬 [begin,end) 的 id 区间
+ * @return 0 或 LFS_OK_RELOCATED；坏块自动换块重试
+ * @note   搬迁的两种触发：rev 达到 block_cycles 模数（磨损均衡，tired）
+ *         或写坏块。superblock（块 0/1）不可搬迁——它就是根，
+ *         磨损耗尽时报 LFS_ERR_NOSPC（文件系统"冻结"），这是
+ *         littlefs 唯一无法自愈的点。
+ */
 static int lfs_dir_compact(lfs_t *lfs,
         lfs_mdir_t *dir, const struct lfs_mattr *attrs, int attrcount,
         lfs_mdir_t *source, uint16_t begin, uint16_t end) {
@@ -2000,6 +2339,7 @@ static int lfs_dir_compact(lfs_t *lfs,
     }
 #endif
 
+    // 磨损均衡：这对块写到寿命就主动换块，把元数据磨损摊到全盘
     if (tired && lfs_pair_cmp(dir->pair, (const lfs_block_t[2]){0, 1}) != 0) {
         // we're writing too much, time to relocate
         goto relocate;
@@ -2029,6 +2369,7 @@ static int lfs_dir_compact(lfs_t *lfs,
                 return err;
             }
 
+            // rev 先行写盘：fetchmatch 靠它裁决新旧，所以它必须最先落笔
             // write out header
             dir->rev = lfs_tole32(dir->rev);
             err = lfs_dir_commitprog(lfs, &commit,
@@ -2151,6 +2492,12 @@ relocate:
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief compact 前的"能分则分"：按 40 字节保留量反复折半到放得下
+ * @note  分不出去（无空闲块）就降级为纯 compact（性能换可用性）；
+ *        superblock 还有扩张路径：盘使用率 <~88% 时把超块链再长一格
+ *        延长根寿命（扩张不可回收，故保守）。
+ */
 static int lfs_dir_splittingcompact(lfs_t *lfs, lfs_mdir_t *dir,
         const struct lfs_mattr *attrs, int attrcount,
         lfs_mdir_t *source, uint16_t begin, uint16_t end) {
@@ -2260,6 +2607,16 @@ static int lfs_dir_splittingcompact(lfs_t *lfs, lfs_mdir_t *dir,
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 元数据提交的执行体：先试日志追加，失败/到期则 compact
+ * @param  pair 提交前该对的原始块号（fixmlist 用它同步打开句柄）
+ * @return 0 / LFS_OK_DROPPED（该对已空应从链上摘除）/ LFS_OK_RELOCATED
+ * @note   三段式：1) 预演 attrs 对 count/tail 的影响，空了对先摘；
+ *         2) erased 且未满则直接追加（快路径，掉电窗口=一条 commit+crc）；
+ *         3) 否则 splittingcompact 重写。
+ *         fixmlist 两遍扫描修正所有打开句柄的 id/pair，保证之后的
+ *         读写仍落在正确的条目上。
+ */
 static int lfs_dir_relocatingcommit(lfs_t *lfs, lfs_mdir_t *dir,
         const lfs_block_t pair[2],
         const struct lfs_mattr *attrs, int attrcount,
@@ -2434,8 +2791,17 @@ fixmlist:;
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief commit 的完整版：处理搬迁连锁（父指针/前驱 tail）与孤儿
+ * @note  搬迁会让"父目录里的 DIRSTRUCT 指针"与"目录链前驱的 tail"
+ *        同时失效——两者无法在一个 commit 里原子完成，于是 littlefs
+ *        把中间态合法化（孤儿/half-orphan 计入 gstate），掉电后由
+ *        deorphan 二次修复。用 while 展开尾递归，避免无界栈。
+ */
 static int lfs_dir_orphaningcommit(lfs_t *lfs, lfs_mdir_t *dir,
         const struct lfs_mattr *attrs, int attrcount) {
+    // 内联文件若超过 cache_size 且非 RAM 背书，提交前强制 outline：
+    // 元数据 compact 会重写数据所在的元数据块，必须先把数据挪走
     // check for any inline files that aren't RAM backed and
     // forcefully evict them, needed for filesystem consistency
     for (lfs_file_t *f = (lfs_file_t*)lfs->mlist; f; f = f->next) {
@@ -2627,6 +2993,11 @@ static int lfs_dir_orphaningcommit(lfs_t *lfs, lfs_mdir_t *dir,
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 元数据提交总入口：orphaningcommit + 收尾去孤儿
+ * @note  返回 LFS_OK_ORPHANED 时立刻同步 deorphan(false)，把连锁
+ *        孤儿清干净再返回用户——对外永远呈现一致状态。
+ */
 static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         const struct lfs_mattr *attrs, int attrcount) {
     int orphans = lfs_dir_orphaningcommit(lfs, dir, attrs, attrcount);
@@ -2651,6 +3022,12 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
 
 /// Top level directory operations ///
 #ifndef LFS_READONLY
+/**
+ * @brief 创建目录：分配新元数据对 → 挂到目录链尾 → 在父目录登记条目
+ * @note  全程跨多个元数据对，无法一次原子；靠 gstate 孤儿计数 +
+ *        下次写前 forceconsistency 补偿。链中段插入还要回改前驱的
+ *        softtail（目录链 desync 的两个来源之一，另一个是搬迁）。
+ */
 static int lfs_mkdir_(lfs_t *lfs, const char *path) {
     // deorphan if we haven't yet, needed at most once after poweron
     int err = lfs_fs_forceconsistency(lfs);
@@ -2747,6 +3124,10 @@ static int lfs_mkdir_(lfs_t *lfs, const char *path) {
 }
 #endif
 
+/**
+ * @brief 打开目录：定位路径 → fetch 头块 → 登记 mlist（pos 从 0 起）
+ * @note  root 目录直接用 lfs->root；普通目录从父条目的 DIRSTRUCT 取对。
+ */
 static int lfs_dir_open_(lfs_t *lfs, lfs_dir_t *dir, const char *path) {
     lfs_stag_t tag = lfs_dir_find(lfs, &dir->m, &path, NULL);
     if (tag < 0) {
@@ -2791,6 +3172,7 @@ static int lfs_dir_open_(lfs_t *lfs, lfs_dir_t *dir, const char *path) {
     return 0;
 }
 
+/** @brief 关闭目录：从 mlist 摘除（无盘上副作用） */
 static int lfs_dir_close_(lfs_t *lfs, lfs_dir_t *dir) {
     // remove from list of mdirs
     lfs_mlist_remove(lfs, (struct lfs_mlist *)dir);
@@ -2798,6 +3180,12 @@ static int lfs_dir_close_(lfs_t *lfs, lfs_dir_t *dir) {
     return 0;
 }
 
+/**
+ * @brief 迭代目录项：pos 0/1 合成 "."/".."，之后按 id 顺序产出
+ * @return true 有条目（info 已填）；false 到尾；负错误码
+ * @note  本对读尽沿 tail 跨块；被删除的空洞（NOENT）静默跳过，
+ *        调用方看到的永远是连续条目。
+ */
 static int lfs_dir_read_(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
     memset(info, 0, sizeof(*info));
 
@@ -2843,6 +3231,11 @@ static int lfs_dir_read_(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
     return true;
 }
 
+/**
+ * @brief 目录定位：rewind 后按条目序号快进（跨块推进）
+ * @note  tell/seek 的坐标是"条目序号"而非字节偏移；root 对的
+ *        superblock 条目（id 0）对用户不可见，定位时跳过。
+ */
 static int lfs_dir_seek_(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
     // simply walk from head dir
     int err = lfs_dir_rewind_(lfs, dir);
@@ -2880,11 +3273,13 @@ static int lfs_dir_seek_(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
     return 0;
 }
 
+/** @brief 返回目录迭代位置（条目序号，含 ./.. 两个合成项） */
 static lfs_soff_t lfs_dir_tell_(lfs_t *lfs, lfs_dir_t *dir) {
     (void)lfs;
     return dir->pos;
 }
 
+/** @brief 回到目录开头：重新 fetch 头块并清零 id/pos */
 static int lfs_dir_rewind_(lfs_t *lfs, lfs_dir_t *dir) {
     // reload the head dir
     int err = lfs_dir_fetch(lfs, &dir->m, dir->head);
@@ -2899,6 +3294,14 @@ static int lfs_dir_rewind_(lfs_t *lfs, lfs_dir_t *dir) {
 
 
 /// File index list operations ///
+/**
+ * @brief CTZ 跳表核心数学：由文件内偏移求 (块序号, 块内偏移)
+ * @note  第 n 块含 ctz(n)+1 个指针，平均每块 2 指针（几何级数）。
+ *        利用恒等式 sum_{i<=n}(ctz(i)+1) = 2n - popcount(n)（OEIS
+ *        A001511/A005187），把 O(n) 求和折成 O(1)：先以 (B-8) 估
+ *        n'，再用 popcount 修正一次即精确（DESIGN.md 公式 6/7）。
+ *        这是"文件元数据只需 head+size 两个 32 位数"的全部代价。
+ */
 static int lfs_ctz_index(lfs_t *lfs, lfs_off_t *off) {
     lfs_off_t size = *off;
     lfs_off_t b = lfs->cfg->block_size - 2*4;
@@ -2912,6 +3315,12 @@ static int lfs_ctz_index(lfs_t *lfs, lfs_off_t *off) {
     return i;
 }
 
+/**
+ * @brief CTZ 跳表查询：定位 pos 所在数据块（O(log n) 次读）
+ * @note  贪心跳跃：每次选"不超过目标的最大跳距"，与二分等价；
+ *        从尾部 head 往文件开头跳——backwards 链表 + 多层指针
+ *        把顺读从 O(n^2) 压到 O(n log n) 的地方就在这里。
+ */
 static int lfs_ctz_find(lfs_t *lfs,
         const lfs_cache_t *pcache, lfs_cache_t *rcache,
         lfs_block_t head, lfs_size_t size,
@@ -2926,6 +3335,7 @@ static int lfs_ctz_find(lfs_t *lfs,
     lfs_off_t target = lfs_ctz_index(lfs, &pos);
 
     while (current > target) {
+        // 跳距 = min(能覆盖目标的 2^k, 当前块实际可用的指针数)
         lfs_size_t skip = lfs_min(
                 lfs_npw2(current-target+1) - 1,
                 lfs_ctz(current));
@@ -2947,6 +3357,15 @@ static int lfs_ctz_find(lfs_t *lfs,
 }
 
 #ifndef LFS_READONLY
+/**
+ * @brief CTZ 跳表追加一块：分配 → 擦除 → 写 skips 个指针 → 返回数据偏移
+ * @param  block/off 输出：新数据块的写入位置
+ * @note  尾块不满时先把旧尾块数据原样搬进新块（COW），再补指针：
+ *        第 index 块写 ctz(index)+1 个 4 字节指针，指向 index-1、
+ *        index-1-2^0、index-1-2^1……追加写永不触碰旧链——
+ *        littlefs 文件追加无写放大、掉电只丢新块的根源。
+ *        坏块直接换块重试（RAM 里什么都没丢）。
+ */
 static int lfs_ctz_extend(lfs_t *lfs,
         lfs_cache_t *pcache, lfs_cache_t *rcache,
         lfs_block_t head, lfs_size_t size,
@@ -3005,6 +3424,8 @@ static int lfs_ctz_extend(lfs_t *lfs,
                 return 0;
             }
 
+            // 指针区：第 index 块共 ctz(index)+1 个指针，从低层到高层
+            // 依次写 nhead 链；写一个读一个（沿旧跳表向下走）
             // append block
             index += 1;
             lfs_size_t skips = lfs_ctz(index) + 1;
@@ -3046,6 +3467,11 @@ relocate:
 }
 #endif
 
+/**
+ * @brief 从尾到头遍历 CTZ 跳表全部数据块（fs_traverse / 统计用）
+ * @note  利用跳表结构分治下降：count = 2-(index&1)，每步沿最大指针
+ *        下潜并累加沿途块，O(n) 访问全部块且 RAM O(1)。
+ */
 static int lfs_ctz_traverse(lfs_t *lfs,
         const lfs_cache_t *pcache, lfs_cache_t *rcache,
         lfs_block_t head, lfs_size_t size,
@@ -3091,6 +3517,15 @@ static int lfs_ctz_traverse(lfs_t *lfs,
 
 
 /// Top level file operations ///
+/**
+ * @brief 打开文件的实现：路径解析 → 建条目/读元数据 → 载属性 → 备缓存
+ * @param  flags LFS_O_* 组合；LFS_O_CREAT 才允许新建
+ * @return 0 成功；失败清资源并置 LFS_F_ERRED
+ * @note  写打开前先 forceconsistency（首次写前清孤儿/完成 move）；
+ *        新文件以 INLINESTRUCT 落地（先内联，超过 inline_max 才 outline）；
+ *        LFS_O_TRUNC 只在 RAM 里改 tag，等 sync 时一并原子提交；
+ *        LFS_O_EXCL 与已有条目冲突时报 LFS_ERR_EXIST。
+ */
 static int lfs_file_opencfg_(lfs_t *lfs, lfs_file_t *file,
         const char *path, int flags,
         const struct lfs_file_config *cfg) {
@@ -3264,6 +3699,7 @@ cleanup:
 }
 
 #ifndef LFS_NO_MALLOC
+/** @brief 无额外配置的打开：默认 lfs_file_config（缓存走 malloc） */
 static int lfs_file_open_(lfs_t *lfs, lfs_file_t *file,
         const char *path, int flags) {
     static const struct lfs_file_config defaults = {0};
@@ -3272,6 +3708,11 @@ static int lfs_file_open_(lfs_t *lfs, lfs_file_t *file,
 }
 #endif
 
+/**
+ * @brief 关闭文件：sync 提交元数据 → 摘 mlist → 释放缓存
+ * @note  LFS_F_ERRED（写过程中出错）时跳过 sync——半截数据绝不提交，
+ *        掉电安全在单次调用的错误路径里同样成立。
+ */
 static int lfs_file_close_(lfs_t *lfs, lfs_file_t *file) {
     int err = 0;
 #ifndef LFS_READONLY
@@ -3294,6 +3735,11 @@ static int lfs_file_close_(lfs_t *lfs, lfs_file_t *file) {
 
 
 #ifndef LFS_READONLY
+/**
+ * @brief 把"正在写"的文件数据搬到新块（坏块恢复 / inline 转 CTZ）
+ * @note  逐字节经缓存搬运，源可以是脏缓存（未冲刷的新数据）或盘；
+ *        搬完把 pcache 内容直接接管为 file->cache，省一次重读。
+ */
 static int lfs_file_relocate(lfs_t *lfs, lfs_file_t *file) {
     while (true) {
         // just relocate what exists into new block
@@ -3365,6 +3811,7 @@ relocate:
 #endif
 
 #ifndef LFS_READONLY
+/** @brief inline 文件转 CTZ 文件：数据搬出元数据对，独立成块链 */
 static int lfs_file_outline(lfs_t *lfs, lfs_file_t *file) {
     file->off = file->pos;
     lfs_alloc_ckpoint(lfs);
@@ -3378,6 +3825,13 @@ static int lfs_file_outline(lfs_t *lfs, lfs_file_t *file) {
 }
 #endif
 
+/**
+ * @brief 把文件的 RAM 状态与盘对齐：丢弃读缓存 / 落写缓存
+ * @note  写路径（CTZ 文件）：先从旧 ctz 把 pos 之后的数据逐字节拷到
+ *        新分支（COW 下旧数据仍完整可读），再冲刷缓存；全部完成后
+ *        ctz.head/size 才指向新分支——在此之前掉电，元数据未提交，
+ *        文件仍是旧版本（掉电一致性窗口被压到"一次元数据提交"）。
+ */
 static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file) {
     if (file->flags & LFS_F_READING) {
         if (!(file->flags & LFS_F_INLINE)) {
@@ -3459,6 +3913,13 @@ relocate:
 }
 
 #ifndef LFS_READONLY
+/**
+ * @brief 文件提交：flush 数据 → sync 落盘 → 提交元数据（ctz/inline + attrs）
+ * @note  顺序是掉电一致性的关键：数据必须先于元数据物理落盘，
+ *        否则元数据可能指向没写完的块；元数据提交成功才清
+ *        LFS_F_DIRTY。同一文件的其他打开句柄被标记 LFS_F_DUSTY，
+ *        下次操作时强制重新同步。
+ */
 static int lfs_file_sync_(lfs_t *lfs, lfs_file_t *file) {
     int err = lfs_file_flush(lfs, file);
     if (err) {
@@ -3525,6 +3986,11 @@ static int lfs_file_sync_(lfs_t *lfs, lfs_file_t *file) {
 }
 #endif
 
+/**
+ * @brief 读的执行体：定位块 → 经缓存拷出，跨块循环
+ * @note  inline 文件从元数据对切片读（lfs_dir_getread）；CTZ 文件由
+ *        ctz_find 定位后 bd_read。pos 越过 ctz.size 返回 0（EOF）。
+ */
 static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
         void *buffer, lfs_size_t size) {
     uint8_t *data = buffer;
@@ -3586,6 +4052,7 @@ static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
     return size;
 }
 
+/** @brief 读入口：若正在写先 flush（读写在同一句柄上互斥的约定） */
 static lfs_ssize_t lfs_file_read_(lfs_t *lfs, lfs_file_t *file,
         void *buffer, lfs_size_t size) {
     LFS_ASSERT((file->flags & LFS_O_RDONLY) == LFS_O_RDONLY);
@@ -3605,11 +4072,19 @@ static lfs_ssize_t lfs_file_read_(lfs_t *lfs, lfs_file_t *file,
 
 
 #ifndef LFS_READONLY
+/**
+ * @brief 写的执行体：inline 超限先 outline；定位/追加块；经缓存写入
+ * @note  追加场景只碰尾块（CObW：整条 CTZ 链无需重写，文件写入
+ *        零写放大的原因）；seek 写（pos < ctz.size）从 pos-1 定位
+ *        尾块继续写，其后旧数据会在 flush 时被逐字节拷到新分支。
+ */
 static lfs_ssize_t lfs_file_flushedwrite(lfs_t *lfs, lfs_file_t *file,
         const void *buffer, lfs_size_t size) {
     const uint8_t *data = buffer;
     lfs_size_t nsize = size;
 
+    // inline 容量上限（默认 min(cache_size, attr_max, 块/8)）：超过即
+    // 转 CTZ 文件，避免元数据对被单文件撑爆
     if ((file->flags & LFS_F_INLINE) &&
             lfs_max(file->pos+nsize, file->ctz.size) > lfs->inline_max) {
         // inline file doesn't fit anymore
@@ -3689,6 +4164,11 @@ relocate:
     return size;
 }
 
+/**
+ * @brief 写入口：READ 中先 flush；APPEND 跳到末尾；file_max 拒绝超限
+ * @note  pos > size 的"稀疏写"用逐字节 0 填洞（littlefs 不做稀疏
+ *        存储，洞就是真实的 0x00 数据）；成功才清 ERRED/DUSTY。
+ */
 static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
         const void *buffer, lfs_size_t size) {
     LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
@@ -3733,6 +4213,10 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
 }
 #endif
 
+/**
+ * @brief 重定位：同块内且缓存覆盖目标偏移时直接改 off（免 flush）；
+ *        否则 flush 后改 pos。31 位文件尺寸上限保证无符号回绕烦恼。
+ */
 static lfs_soff_t lfs_file_seek_(lfs_t *lfs, lfs_file_t *file,
         lfs_soff_t off, int whence) {
     // find new pos
@@ -3786,6 +4270,12 @@ static lfs_soff_t lfs_file_seek_(lfs_t *lfs, lfs_file_t *file,
 }
 
 #ifndef LFS_READONLY
+/**
+ * @brief 截断：缩小到 ≤inline_max 时退回 inline（省空间）；
+ *        否则 ctz_find 定位新尾改 head/size；扩大则补 0
+ * @note  截掉的尾块不擦除（没有空闲链表），等搬迁/复用时自然回收；
+ *        收缩/扩张后都恢复原 pos，保持 POSIX truncate 语义。
+ */
 static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
     LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
 
@@ -3868,11 +4358,13 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
 }
 #endif
 
+/** @brief 返回当前读写位置（RAM 内的 file->pos，无 IO） */
 static lfs_soff_t lfs_file_tell_(lfs_t *lfs, lfs_file_t *file) {
     (void)lfs;
     return file->pos;
 }
 
+/** @brief 回到文件头（= seek 到 0） */
 static int lfs_file_rewind_(lfs_t *lfs, lfs_file_t *file) {
     lfs_soff_t res = lfs_file_seek_(lfs, file, 0, LFS_SEEK_SET);
     if (res < 0) {
@@ -3882,6 +4374,10 @@ static int lfs_file_rewind_(lfs_t *lfs, lfs_file_t *file) {
     return 0;
 }
 
+/**
+ * @brief 文件大小：WRITING 时取 max(pos, ctz.size)——RAM 视角已含
+ *        未提交的写入；否则直接返回元数据里的 ctz.size。
+ */
 static lfs_soff_t lfs_file_size_(lfs_t *lfs, lfs_file_t *file) {
     (void)lfs;
 
@@ -3896,6 +4392,7 @@ static lfs_soff_t lfs_file_size_(lfs_t *lfs, lfs_file_t *file) {
 
 
 /// General fs operations ///
+/** @brief stat：dir_find 后取 info；文件路径带尾 '/' 报 NOTDIR */
 static int lfs_stat_(lfs_t *lfs, const char *path, struct lfs_info *info) {
     lfs_mdir_t cwd;
     lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &path, NULL);
@@ -3913,6 +4410,12 @@ static int lfs_stat_(lfs_t *lfs, const char *path, struct lfs_info *info) {
 }
 
 #ifndef LFS_READONLY
+/**
+ * @brief 删除文件/空目录：写 DELETE tag；目录则先造孤儿再断链
+ * @note  目录删除时序：+1 孤儿 → 父目录 DELETE → 前驱对 drop tail
+ *        （-1 孤儿）。中间任何时刻掉电，gstate 孤儿计数都能让
+ *        deorphan 把链修好——"用合法中间态换原子性"的样板。
+ */
 static int lfs_remove_(lfs_t *lfs, const char *path) {
     // deorphan if we haven't yet, needed at most once after poweron
     int err = lfs_fs_forceconsistency(lfs);
@@ -3994,6 +4497,14 @@ static int lfs_remove_(lfs_t *lfs, const char *path) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 重命名/移动：目标对写 CREATE+move 标记，源对写 DELETE
+ * @note  跨元数据对时用 gstate 的 MOVESTATE 实现两段式原子：
+ *        1) 目标对提交 {DELETE 旧, CREATE, NAME, FROM_MOVE} + gstate 记 move；
+ *        2) 源对提交 DELETE + 清 gstate。掉电落在中间 => 挂载后
+ *        demove 删源，效果等于已完成移动（文件绝不丢失/复制）。
+ *        同对内退化为一次提交（含 DELETE 引起的 id 平移修正）。
+ */
 static int lfs_rename_(lfs_t *lfs, const char *oldpath, const char *newpath) {
     // deorphan if we haven't yet, needed at most once after poweron
     int err = lfs_fs_forceconsistency(lfs);
@@ -4140,6 +4651,11 @@ static int lfs_rename_(lfs_t *lfs, const char *oldpath, const char *newpath) {
 }
 #endif
 
+/**
+ * @brief 读自定义属性：USERATTR+type tag 切片读
+ * @note  root 特判（id 0x3ff → root 对的 id 0）；不存在返回
+ *        LFS_ERR_NOATTR；返回值是盘上实际长度（可大于缓冲）。
+ */
 static lfs_ssize_t lfs_getattr_(lfs_t *lfs, const char *path,
         uint8_t type, void *buffer, lfs_size_t size) {
     lfs_mdir_t cwd;
@@ -4174,6 +4690,7 @@ static lfs_ssize_t lfs_getattr_(lfs_t *lfs, const char *path,
 }
 
 #ifndef LFS_READONLY
+/** @brief 写/删自定义属性的公共体（size=0x3ff 即删除标记） */
 static int lfs_commitattr(lfs_t *lfs, const char *path,
         uint8_t type, const void *buffer, lfs_size_t size) {
     lfs_mdir_t cwd;
@@ -4198,6 +4715,7 @@ static int lfs_commitattr(lfs_t *lfs, const char *path,
 #endif
 
 #ifndef LFS_READONLY
+/** @brief 设置属性：超 attr_max 先拒绝，再走 commitattr */
 static int lfs_setattr_(lfs_t *lfs, const char *path,
         uint8_t type, const void *buffer, lfs_size_t size) {
     if (size > lfs->attr_max) {
@@ -4209,6 +4727,7 @@ static int lfs_setattr_(lfs_t *lfs, const char *path,
 #endif
 
 #ifndef LFS_READONLY
+/** @brief 删除属性：size=0x3ff 的删除 tag；属性本就不存在时无操作 */
 static int lfs_removeattr_(lfs_t *lfs, const char *path, uint8_t type) {
     return lfs_commitattr(lfs, path, type, NULL, 0x3ff);
 }
@@ -4231,6 +4750,15 @@ static int lfs_removeattr_(lfs_t *lfs, const char *path, uint8_t type) {
 #endif
 
 // common filesystem initialization
+/**
+ * @brief 公共初始化（format/mount/migrate 共用）：校验 config →
+ *        分配三个缓存 → 解析上限 → 清零状态
+ * @note  RAM 预算 = 2*cache_size（rcache/pcache）+ lookahead_size
+ *        + 每打开一个文件再加 cache_size，全部可用 cfg->*_buffer
+ *        静态提供（无堆系统友好）；这一堆 LFS_ASSERT 把配置约束
+ *        （对齐倍数、CTZ 指针不溢出块、block_cycles 非零等）全部
+ *        前置到挂载时刻，而不是写盘时才炸。
+ */
 static int lfs_init(lfs_t *lfs, const struct lfs_config *cfg) {
     lfs->cfg = cfg;
     lfs->block_count = cfg->block_count;  // May be 0
@@ -4271,6 +4799,8 @@ static int lfs_init(lfs_t *lfs, const struct lfs_config *cfg) {
     LFS_ASSERT(lfs->cfg->cache_size % lfs->cfg->prog_size == 0);
     LFS_ASSERT(lfs->cfg->block_size % lfs->cfg->cache_size == 0);
 
+    // CTZ 指针区上限：4*npw2(0xffffffff/(block_size-8)) <= block_size，
+    // 32 位文件尺寸下块 >=104 字节即安全（这里用精确公式而非 128 拍脑袋）
     // check that the block size is large enough to fit all ctz pointers
     LFS_ASSERT(lfs->cfg->block_size >= 128);
     // this is the exact calculation for all ctz pointers, if this fails
@@ -4404,6 +4934,7 @@ cleanup:
     return err;
 }
 
+/** @brief 释放三个缓存（用户静态提供的不释放）；不碰盘 */
 static int lfs_deinit(lfs_t *lfs) {
     // free allocated memory
     if (!lfs->cfg->read_buffer) {
@@ -4424,6 +4955,12 @@ static int lfs_deinit(lfs_t *lfs) {
 
 
 #ifndef LFS_READONLY
+/**
+ * @brief 格式化：初始化 → 根对分配 → 写超块（magic+配置） → 强制 compact
+ * @note  第二次空 commit 强制 compact 是防"同块旧版本数据"残留
+ *        （旧 2.0 盘的残迹可能被误挂载）；结尾 fetch 自检一次。
+ *        超块条目固定占 id 0，magic "littlefs" 恒在偏移 8 处。
+ */
 static int lfs_format_(lfs_t *lfs, const struct lfs_config *cfg) {
     int err = 0;
     {
@@ -4497,6 +5034,11 @@ struct lfs_tortoise_t {
     lfs_size_t period;
 };
 
+/**
+ * @brief Brent 龟兔算法检测 tail 链成环（损坏盘防御，O(1) RAM）
+ * @note  兔子每步走一格，乌龟按 1,2,4,8... 周期驻留；同格相遇即环。
+ *        挂载/遍历/找前驱都要沿 tail 链走，环会让它们死循环。
+ */
 static int lfs_tortoise_detectcycles(
     const lfs_mdir_t *dir, struct lfs_tortoise_t *tortoise) {
     // detect cycles with Brent's algorithm
@@ -4515,6 +5057,14 @@ static int lfs_tortoise_detectcycles(
     return LFS_ERR_OK;
 }
 
+/**
+ * @brief 挂载：沿 tail 链扫全盘 → 找 superblock → 校验版本/配置 →
+ *        聚合 gstate → 随机化分配起点
+ * @note  超块链从块 {0,1} 开始，最后一个含 superblock 的对就是
+ *        root 目录（超块链尾部=root，SPEC.md 的关键设计）；
+ *        盘是旧次版本时置 needssuperblock 位，首次写前重写超块；
+ *        cfg->block_count=0 表示"以盘上为准"。
+ */
 static int lfs_mount_(lfs_t *lfs, const struct lfs_config *cfg) {
     int err = lfs_init(lfs, cfg);
     if (err) {
@@ -4665,11 +5215,15 @@ static int lfs_mount_(lfs_t *lfs, const struct lfs_config *cfg) {
                 lfs->gstate.pair[0],
                 lfs->gstate.pair[1]);
     }
+    // gstate 可能聚合自"未写区域全 0xff"：valid 位回绕 +1 修正，
+    // 让 RAM 里的 gstate 恒为规范形态
     lfs->gstate.tag += !lfs_tag_isvalid(lfs->gstate.tag);
     lfs->gdisk = lfs->gstate;
 
     // setup free lookahead, to distribute allocations uniformly across
     // boots, we start the allocator at a random location
+    // 伪随机起点：seed 来自各对 CRC 的再 CRC（跨掉电稳定），
+    // 使分配窗口在盘上均匀分布——动态磨损均衡的另一半
     lfs->lookahead.start = lfs->seed % lfs->block_count;
     lfs_alloc_drop(lfs);
 
@@ -4680,12 +5234,21 @@ cleanup:
     return err;
 }
 
+/**
+ * @brief 卸载实现：只释放 RAM（所有写已在各 sync/commit 时提交，
+ *        卸载本身没有"必须落盘"的尾巴——这也是掉电安全的一种体现）
+ */
 static int lfs_unmount_(lfs_t *lfs) {
     return lfs_deinit(lfs);
 }
 
 
 /// Filesystem filesystem operations ///
+/**
+ * @brief 盘上信息：版本/几何/上限
+ * @note  needssuperblock（挂载到旧次版本盘）时真实版本要从盘上
+ *        superblock 读，其余字段直接用 RAM 缓存值。
+ */
 static int lfs_fs_stat_(lfs_t *lfs, struct lfs_fsinfo *fsinfo) {
     // if the superblock is up-to-date, we must be on the most recent
     // minor version of littlefs
@@ -4726,6 +5289,14 @@ static int lfs_fs_stat_(lfs_t *lfs, struct lfs_fsinfo *fsinfo) {
     return 0;
 }
 
+/**
+ * @brief 全盘在用块遍历（分配器扫描/容量统计/收缩检查的地基）
+ * @param  includeorphans 是否把 DIRSTRUCT 指向的对也计入
+ *        （deorphan 前的扫描要计入，否则孤儿会被当成空闲块分配出去）
+ * @note  覆盖三类引用：tail 链上的元数据对、各文件 CTZ 数据块、
+ *        打开中脏文件的 RAM 分支（未提交也要算，防止分配到正在
+ *        使用的块——这是"打开文件也是文件系统状态"的体现）。
+ */
 int lfs_fs_traverse_(lfs_t *lfs,
         int (*cb)(void *data, lfs_block_t block), void *data,
         bool includeorphans) {
@@ -4830,6 +5401,11 @@ int lfs_fs_traverse_(lfs_t *lfs,
 }
 
 #ifndef LFS_READONLY
+/**
+ * @brief 在目录链上找 pair 的前驱对（无前驱=NOENT）
+ * @note  drop 空对/修孤儿时都要"改前驱的 tail"，先得找到前驱；
+ *        同样用龟兔防环。
+ */
 static int lfs_fs_pred(lfs_t *lfs,
         const lfs_block_t pair[2], lfs_mdir_t *pdir) {
     // iterate over all directory directory entries
@@ -4869,6 +5445,7 @@ struct lfs_fs_parent_match {
 #endif
 
 #ifndef LFS_READONLY
+/** @brief fetchmatch 回调：比较磁盘上的 DIRSTRUCT 指针与目标对 */
 static int lfs_fs_parent_match(void *data,
         lfs_tag_t tag, const void *buffer) {
     struct lfs_fs_parent_match *find = data;
@@ -4890,6 +5467,11 @@ static int lfs_fs_parent_match(void *data,
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 全链反查"谁引用了这个子目录"（O(n) 扫描）
+ * @note  只在孤儿修复/搬迁连锁时用；找到的 tag 即父对里
+ *        DIRSTRUCT 条目的 tag（含 id）。
+ */
 static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
         lfs_mdir_t *parent) {
     // use fetchmatch with callback to find pairs
@@ -4922,12 +5504,19 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
 }
 #endif
 
+/** @brief 置/清 gstate 的 needssuperblock 位（tag 的 size bit9） */
 static void lfs_fs_prepsuperblock(lfs_t *lfs, bool needssuperblock) {
     lfs->gstate.tag = (lfs->gstate.tag & ~LFS_MKTAG(0, 0, 0x200))
             | (uint32_t)needssuperblock << 9;
 }
 
 #ifndef LFS_READONLY
+/**
+ * @brief 孤儿计数 ±1，并把"有孤儿"同步进 tag 最高位
+ * @note  size 字段低 9 位是计数，bit31 是标志（提交到盘上就是
+ *        MOVESTATE 的 sync 位语义）；两处必须一致，否则挂载聚合
+ *        后的状态会失真。这条位运算就是"孤儿"在 gstate 里的全部分身。
+ */
 static int lfs_fs_preporphans(lfs_t *lfs, int8_t orphans) {
     LFS_ASSERT(lfs_tag_size(lfs->gstate.tag) > 0x000 || orphans >= 0);
     LFS_ASSERT(lfs_tag_size(lfs->gstate.tag) < 0x1ff || orphans <= 0);
@@ -4940,6 +5529,11 @@ static int lfs_fs_preporphans(lfs_t *lfs, int8_t orphans) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 设置/清除 gstate 的 move 字段（id=0x3ff 即清除）
+ * @note  move 字段记录"源对+源 id"，跨对 rename 的第一段提交
+ *        前设置、第二段提交时清除。
+ */
 static void lfs_fs_prepmove(lfs_t *lfs,
         uint16_t id, const lfs_block_t pair[2]) {
     lfs->gstate.tag = ((lfs->gstate.tag & ~LFS_MKTAG(0x7ff, 0x3ff, 0)) |
@@ -4950,6 +5544,7 @@ static void lfs_fs_prepmove(lfs_t *lfs,
 #endif
 
 #ifndef LFS_READONLY
+/** @brief 首写前重写超块（挂载到旧次版本盘后的就地升级） */
 static int lfs_fs_desuperblock(lfs_t *lfs) {
     if (!lfs_gstate_needssuperblock(&lfs->gstate)) {
         return 0;
@@ -4989,6 +5584,12 @@ static int lfs_fs_desuperblock(lfs_t *lfs) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 完成掉电遗留的 move：删源条目并清 gstate
+ * @note  目标条目已在（move 前半已提交成功），所以"删除源"就是
+ *        move 的语义收尾；这是掉电后文件同时出现在源和目标的
+ *        唯一消除点（mkconsistent/首次写都会走到）。
+ */
 static int lfs_fs_demove(lfs_t *lfs) {
     if (!lfs_gstate_hasmove(&lfs->gdisk)) {
         return 0;
@@ -5025,6 +5626,14 @@ static int lfs_fs_demove(lfs_t *lfs) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 孤儿回收核心：两遍扫描，pass0 修 half-orphan，pass1 修全孤儿
+ * @note  pass0：链上有父但父指针与链不同步（搬迁遗留）→ 改写父指针；
+ *        pass1：链上有但无父（remove/rename 遗留）→ 从链上摘除，
+ *        块自然回到空闲池。修复过程可能制造新孤儿 => moreorphans
+ *        重来。powerloss=false 时只修 half-orphan：主动操作留下的
+ *        孤儿是"有意为之的中间态"，马上会被后续步骤收尾，不能误摘。
+ */
 static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
     if (!lfs_gstate_hasorphans(&lfs->gstate)) {
         return 0;
@@ -5113,6 +5722,8 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
                 // note we only check for full orphans if we may have had a
                 // power-loss, otherwise orphans are created intentionally
                 // during operations such as lfs_mkdir
+                // 全孤儿只在"怀疑掉电"时处理：mkdir 等主动操作留下的
+                // 孤儿中间态，随后就会被同一调用的下一步收尾
                 if (pass == 1 && tag == LFS_ERR_NOENT && powerloss) {
                     // we are an orphan
                     LFS_DEBUG("Fixing orphan {0x%"PRIx32", 0x%"PRIx32"}",
@@ -5156,6 +5767,13 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 三连清：重写超块 → 完成 move → 回收孤儿
+ * @note  所有写型 API（open/mkdir/remove/rename…）入口都会调用，
+ *        保证"第一次写之前，上次掉电遗留的全部中间态已清干净"。
+ *        这就是 littlefs 不需要 fsck 的实现方式：修复被摊进
+ *        每次写操作的第一步。
+ */
 static int lfs_fs_forceconsistency(lfs_t *lfs) {
     int err = lfs_fs_desuperblock(lfs);
     if (err) {
@@ -5177,6 +5795,10 @@ static int lfs_fs_forceconsistency(lfs_t *lfs) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief API 版 forceconsistency：额外把 RAM 中未落盘的 gstate 差量
+ *        用一次空 commit 写到 root（对外承诺"返回后无遗留状态"）
+ */
 static int lfs_fs_mkconsistent_(lfs_t *lfs) {
     // lfs_fs_forceconsistency does most of the work here
     int err = lfs_fs_forceconsistency(lfs);
@@ -5206,6 +5828,7 @@ static int lfs_fs_mkconsistent_(lfs_t *lfs) {
 }
 #endif
 
+/** @brief traverse 回调：块计数累加器 */
 static int lfs_fs_size_count(void *p, lfs_block_t block) {
     (void)block;
     lfs_size_t *size = p;
@@ -5213,6 +5836,11 @@ static int lfs_fs_size_count(void *p, lfs_block_t block) {
     return 0;
 }
 
+/**
+ * @brief 统计在用块数
+ * @note  共享 COW 块会被重复计数，所以文档称 best effort——
+ *        结果是"分配视角的占用量"，只会偏大不会偏小。
+ */
 static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
     lfs_size_t size = 0;
     int err = lfs_fs_traverse_(lfs, lfs_fs_size_count, &size, false);
@@ -5225,6 +5853,12 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
 
 // explicit garbage collection
 #ifndef LFS_READONLY
+/**
+ * @brief 显式保洁：forceconsistency → 压实超阈值元数据 → 预热 lookahead
+ * @note  压实手法：把 mdir 置 erased=false 后提交空 commit，
+ *        走 relocatingcommit 的 compact 分支；让昂贵的整理工作
+ *        可以被调度到空闲时段提前做（而非在关键写路径上做）。
+ */
 static int lfs_fs_gc_(lfs_t *lfs) {
     // force consistency, even if we're not necessarily going to write,
     // because this function is supposed to take care of janitorial work
@@ -5248,6 +5882,8 @@ static int lfs_fs_gc_(lfs_t *lfs) {
             }
 
             // not erased? exceeds our compaction threshold?
+            // 默认阈值 ≈88%：dir.off 超过 block_size*7/8 才压，
+            // 与 superblock 扩张的 88% 判据呼应
             if (!mdir.erased || ((lfs->cfg->compact_thresh == 0)
                     ? mdir.off > lfs->cfg->block_size - lfs->cfg->block_size/8
                     : mdir.off > lfs->cfg->compact_thresh)) {
@@ -5278,6 +5914,7 @@ static int lfs_fs_gc_(lfs_t *lfs) {
 
 #ifndef LFS_READONLY
 #ifdef LFS_SHRINKNONRELOCATING
+/** @brief 收缩检查回调：发现块号越界即在用 => 报 NOTEMPTY 中止收缩 */
 static int lfs_shrink_checkblock(void *data, lfs_block_t block) {
     lfs_size_t threshold = *((lfs_size_t*)data);
     if (block >= threshold) {
@@ -5287,6 +5924,11 @@ static int lfs_shrink_checkblock(void *data, lfs_block_t block) {
 }
 #endif
 
+/**
+ * @brief 扩容：改 RAM block_count 并把新值写进超块
+ * @note  littlefs 不回收扩张（超块链不能缩短），收缩仅在
+ *        LFS_SHRINKNONRELOCATING 且越界块全空闲时允许。
+ */
 static int lfs_fs_grow_(lfs_t *lfs, lfs_size_t block_count) {
     int err;
 
@@ -5423,10 +6065,12 @@ typedef struct lfs1_superblock {
 
 
 /// Low-level wrappers v1->v2 ///
+/** @brief v1 迁移辅助：CRC 累加的指针包装 */
 static void lfs1_crc(uint32_t *crc, const void *buffer, size_t size) {
     *crc = lfs_crc(*crc, buffer, size);
 }
 
+/** @brief v1 迁移辅助：带双缓存的块读（v1 盘格式仍走 v2 的缓存层） */
 static int lfs1_bd_read(lfs_t *lfs, lfs_block_t block,
         lfs_off_t off, void *buffer, lfs_size_t size) {
     // if we ever do more than writes to alternating pairs,
@@ -5435,6 +6079,7 @@ static int lfs1_bd_read(lfs_t *lfs, lfs_block_t block,
             block, off, buffer, size);
 }
 
+/** @brief v1 迁移辅助：逐字节流式 CRC（v1 目录校验用） */
 static int lfs1_bd_crc(lfs_t *lfs, lfs_block_t block,
         lfs_off_t off, lfs_size_t size, uint32_t *crc) {
     for (lfs_off_t i = 0; i < size; i++) {
@@ -5452,6 +6097,7 @@ static int lfs1_bd_crc(lfs_t *lfs, lfs_block_t block,
 
 
 /// Endian swapping functions ///
+/** @brief v1 目录头 {rev,size,tail} 端序转换（读盘） */
 static void lfs1_dir_fromle32(struct lfs1_disk_dir *d) {
     d->rev     = lfs_fromle32(d->rev);
     d->size    = lfs_fromle32(d->size);
@@ -5459,6 +6105,7 @@ static void lfs1_dir_fromle32(struct lfs1_disk_dir *d) {
     d->tail[1] = lfs_fromle32(d->tail[1]);
 }
 
+/** @brief v1 目录头端序转换（写盘） */
 static void lfs1_dir_tole32(struct lfs1_disk_dir *d) {
     d->rev     = lfs_tole32(d->rev);
     d->size    = lfs_tole32(d->size);
@@ -5466,16 +6113,19 @@ static void lfs1_dir_tole32(struct lfs1_disk_dir *d) {
     d->tail[1] = lfs_tole32(d->tail[1]);
 }
 
+/** @brief v1 条目端序转换（读盘） */
 static void lfs1_entry_fromle32(struct lfs1_disk_entry *d) {
     d->u.dir[0] = lfs_fromle32(d->u.dir[0]);
     d->u.dir[1] = lfs_fromle32(d->u.dir[1]);
 }
 
+/** @brief v1 条目端序转换（写盘） */
 static void lfs1_entry_tole32(struct lfs1_disk_entry *d) {
     d->u.dir[0] = lfs_tole32(d->u.dir[0]);
     d->u.dir[1] = lfs_tole32(d->u.dir[1]);
 }
 
+/** @brief v1 超块端序转换（读盘） */
 static void lfs1_superblock_fromle32(struct lfs1_disk_superblock *d) {
     d->root[0]     = lfs_fromle32(d->root[0]);
     d->root[1]     = lfs_fromle32(d->root[1]);
@@ -5486,10 +6136,16 @@ static void lfs1_superblock_fromle32(struct lfs1_disk_superblock *d) {
 
 
 ///// Metadata pair and directory operations ///
+/** @brief v1 条目尺寸 = 4 字节头 + elen + alen + nlen */
 static inline lfs_size_t lfs1_entry_size(const lfs1_entry_t *entry) {
     return 4 + entry->d.elen + entry->d.alen + entry->d.nlen;
 }
 
+/**
+ * @brief v1 目录对读取：按 rev 选新块 + 整块 CRC 校验
+ * @note  v1 的目录是"整块提交"（无 per-commit CRC 链），校验失败
+ *        直接弃块，只信 CRC=0 的那块。
+ */
 static int lfs1_dir_fetch(lfs_t *lfs,
         lfs1_dir_t *dir, const lfs_block_t pair[2]) {
     // copy out pair, otherwise may be aliasing dir
@@ -5552,6 +6208,9 @@ static int lfs1_dir_fetch(lfs_t *lfs,
     return 0;
 }
 
+/**
+ * @brief v1 目录条目迭代：跨块沿 tail；size 位31=还有后续块
+ */
 static int lfs1_dir_next(lfs_t *lfs, lfs1_dir_t *dir, lfs1_entry_t *entry) {
     while (dir->off + sizeof(entry->d) > (0x7fffffff & dir->d.size)-4) {
         if (!(0x80000000 & dir->d.size)) {
@@ -5582,6 +6241,11 @@ static int lfs1_dir_next(lfs_t *lfs, lfs1_dir_t *dir, lfs1_entry_t *entry) {
 }
 
 /// littlefs v1 specific operations ///
+/**
+ * @brief 遍历 v1 盘全部在用块（迁移期间的分配器扫描地基）
+ * @note  除 v1 自身的目录/文件块外，还要兼顾"已经迁了一半"的
+ *        v2 目录链（迁移是逐目录完成的，中途可能掉电）。
+ */
 int lfs1_traverse(lfs_t *lfs, int (*cb)(void*, lfs_block_t), void *data) {
     if (lfs_pair_isnull(lfs->lfs1->root)) {
         return 0;
@@ -5651,6 +6315,11 @@ int lfs1_traverse(lfs_t *lfs, int (*cb)(void*, lfs_block_t), void *data) {
     return 0;
 }
 
+/**
+ * @brief 检查 v1 条目是否已被 move（type bit7 且盘上另有副本）
+ * @note  v1 的 move 实现是"打标记+全盘查重"，迁移时必须重演这套
+ *        判定，否则会复制出重复文件。
+ */
 static int lfs1_moved(lfs_t *lfs, const void *e) {
     if (lfs_pair_isnull(lfs->lfs1->root)) {
         return 0;
@@ -5692,6 +6361,9 @@ static int lfs1_moved(lfs_t *lfs, const void *e) {
 }
 
 /// Filesystem operations ///
+/**
+ * @brief 挂载 v1 盘（迁移第一步）：校验 magic 与版本，取 root 指针
+ */
 static int lfs1_mount(lfs_t *lfs, struct lfs1 *lfs1,
         const struct lfs_config *cfg) {
     int err = 0;
@@ -5755,11 +6427,21 @@ cleanup:
     return err;
 }
 
+/** @brief v1 侧卸载（同 lfs_deinit） */
 static int lfs1_unmount(lfs_t *lfs) {
     return lfs_deinit(lfs);
 }
 
 /// v1 migration ///
+/**
+ * @brief v1→v2 迁移：逐目录重建为 v2 元数据对，最后重写超块
+ * @note  迁移期间禁止磨损搬迁（见 lfs_dir_compact 的 lfs1 分支）——
+ *        relocating 会破坏 v1 的目录指针。每个 v1 目录：新建 v2 对
+ *        →逐条目搬（move 标记需全盘查重）→把 v1 尾链进 v2；
+ *        最后把新超块写进 {0,1} 对（复用 v1 的块，rev 延续），
+ *        并强制 compact 防止再被 v1 挂载。任何一步掉电：
+ *        v1 数据未动（只追加），重跑迁移即可。
+ */
 static int lfs_migrate_(lfs_t *lfs, const struct lfs_config *cfg) {
     struct lfs1 lfs1;
 
@@ -5992,6 +6674,10 @@ cleanup:
 
 /// Public API wrappers ///
 
+// 公共 API 薄壳层：每个入口 = 加锁 → TRACE 进参 → 调内部实现
+// → TRACE 返回值 → 解锁。LFS_THREADSAFE 时锁粒度为"整个调用"，
+// 多线程可安全共享同一 lfs_t；未定义时退化为空操作。
+// 断言：打开的 file/dir 必须在 mlist 上（防未开先用/重复打开）。
 // Here we can add tracing/thread safety easily
 
 // Thread-safe wrappers if enabled
@@ -6005,6 +6691,7 @@ cleanup:
 
 // Public API
 #ifndef LFS_READONLY
+/** @brief 格式化块设备（clobbers lfs 对象，返回后处于未挂载态） */
 int lfs_format(lfs_t *lfs, const struct lfs_config *cfg) {
     int err = LFS_LOCK(cfg);
     if (err) {
@@ -6035,6 +6722,7 @@ int lfs_format(lfs_t *lfs, const struct lfs_config *cfg) {
 }
 #endif
 
+/** @brief 挂载；多个 lfs_t 可各自挂不同设备（对象由用户分配） */
 int lfs_mount(lfs_t *lfs, const struct lfs_config *cfg) {
     int err = LFS_LOCK(cfg);
     if (err) {
@@ -6064,6 +6752,7 @@ int lfs_mount(lfs_t *lfs, const struct lfs_config *cfg) {
     return err;
 }
 
+/** @brief 卸载并释放资源（所有脏数据在此之前已由 sync/close 提交） */
 int lfs_unmount(lfs_t *lfs) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6079,6 +6768,7 @@ int lfs_unmount(lfs_t *lfs) {
 }
 
 #ifndef LFS_READONLY
+/** @brief 删除文件/目录（目录必须为空）；原子，掉电不产生半删除 */
 int lfs_remove(lfs_t *lfs, const char *path) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6095,6 +6785,10 @@ int lfs_remove(lfs_t *lfs, const char *path) {
 #endif
 
 #ifndef LFS_READONLY
+/**
+ * @brief 重命名/移动；目标存在须同类型、目录须空；
+ *        跨目录由 gstate 保证原子（见 lfs_rename_）
+ */
 int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6110,6 +6804,7 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath) {
 }
 #endif
 
+/** @brief 查询文件/目录信息（type/size/name） */
 int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6124,6 +6819,7 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
     return err;
 }
 
+/** @brief 读自定义属性；返回盘上长度（可与缓冲不等），无则 NOATTR */
 lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
         uint8_t type, void *buffer, lfs_size_t size) {
     int err = LFS_LOCK(lfs->cfg);
@@ -6141,6 +6837,7 @@ lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
 }
 
 #ifndef LFS_READONLY
+/** @brief 写自定义属性（不存在则隐式创建）；随一次 commit 原子生效 */
 int lfs_setattr(lfs_t *lfs, const char *path,
         uint8_t type, const void *buffer, lfs_size_t size) {
     int err = LFS_LOCK(lfs->cfg);
@@ -6159,6 +6856,7 @@ int lfs_setattr(lfs_t *lfs, const char *path,
 #endif
 
 #ifndef LFS_READONLY
+/** @brief 删自定义属性（不存在则无操作） */
 int lfs_removeattr(lfs_t *lfs, const char *path, uint8_t type) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6175,6 +6873,7 @@ int lfs_removeattr(lfs_t *lfs, const char *path, uint8_t type) {
 #endif
 
 #ifndef LFS_NO_MALLOC
+/** @brief 打开文件（默认配置，缓存 malloc；LFS_NO_MALLOC 时用 opencfg） */
 int lfs_file_open(lfs_t *lfs, lfs_file_t *file, const char *path, int flags) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6192,6 +6891,10 @@ int lfs_file_open(lfs_t *lfs, lfs_file_t *file, const char *path, int flags) {
 }
 #endif
 
+/**
+ * @brief 打开文件（带 per-file 配置：静态缓存/自定义属性列表）
+ * @note  attrs 在 open 时读入、sync/close 时随文件内容原子写回
+ */
 int lfs_file_opencfg(lfs_t *lfs, lfs_file_t *file,
         const char *path, int flags,
         const struct lfs_file_config *cfg) {
@@ -6212,6 +6915,7 @@ int lfs_file_opencfg(lfs_t *lfs, lfs_file_t *file,
     return err;
 }
 
+/** @brief 关闭文件：隐式 sync（这是"写必须 close/sync 才落盘"的落点） */
 int lfs_file_close(lfs_t *lfs, lfs_file_t *file) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6228,6 +6932,7 @@ int lfs_file_close(lfs_t *lfs, lfs_file_t *file) {
 }
 
 #ifndef LFS_READONLY
+/** @brief 手动提交文件（数据+元数据一起原子落盘） */
 int lfs_file_sync(lfs_t *lfs, lfs_file_t *file) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6244,6 +6949,7 @@ int lfs_file_sync(lfs_t *lfs, lfs_file_t *file) {
 }
 #endif
 
+/** @brief 读文件；返回实际读取字节数（可为 0=EOF） */
 lfs_ssize_t lfs_file_read(lfs_t *lfs, lfs_file_t *file,
         void *buffer, lfs_size_t size) {
     int err = LFS_LOCK(lfs->cfg);
@@ -6262,6 +6968,7 @@ lfs_ssize_t lfs_file_read(lfs_t *lfs, lfs_file_t *file,
 }
 
 #ifndef LFS_READONLY
+/** @brief 写文件；close/sync 前只在 RAM 缓存（掉电丢本次未提交写入） */
 lfs_ssize_t lfs_file_write(lfs_t *lfs, lfs_file_t *file,
         const void *buffer, lfs_size_t size) {
     int err = LFS_LOCK(lfs->cfg);
@@ -6280,6 +6987,7 @@ lfs_ssize_t lfs_file_write(lfs_t *lfs, lfs_file_t *file,
 }
 #endif
 
+/** @brief 定位（SET/CUR/END）；越 file_max 报 INVAL */
 lfs_soff_t lfs_file_seek(lfs_t *lfs, lfs_file_t *file,
         lfs_soff_t off, int whence) {
     int err = LFS_LOCK(lfs->cfg);
@@ -6298,6 +7006,7 @@ lfs_soff_t lfs_file_seek(lfs_t *lfs, lfs_file_t *file,
 }
 
 #ifndef LFS_READONLY
+/** @brief 截断/扩展文件到指定大小（扩展补 0） */
 int lfs_file_truncate(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6315,6 +7024,7 @@ int lfs_file_truncate(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
 }
 #endif
 
+/** @brief 返回当前读写位置 */
 lfs_soff_t lfs_file_tell(lfs_t *lfs, lfs_file_t *file) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6330,6 +7040,7 @@ lfs_soff_t lfs_file_tell(lfs_t *lfs, lfs_file_t *file) {
     return res;
 }
 
+/** @brief 回到文件头 */
 int lfs_file_rewind(lfs_t *lfs, lfs_file_t *file) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6344,6 +7055,7 @@ int lfs_file_rewind(lfs_t *lfs, lfs_file_t *file) {
     return err;
 }
 
+/** @brief 文件大小（含未提交写入，WRITING 时取 max(pos,size)） */
 lfs_soff_t lfs_file_size(lfs_t *lfs, lfs_file_t *file) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6360,6 +7072,7 @@ lfs_soff_t lfs_file_size(lfs_t *lfs, lfs_file_t *file) {
 }
 
 #ifndef LFS_READONLY
+/** @brief 创建目录（父目录不存在报 NOENT，重名报 EXIST） */
 int lfs_mkdir(lfs_t *lfs, const char *path) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6375,6 +7088,7 @@ int lfs_mkdir(lfs_t *lfs, const char *path) {
 }
 #endif
 
+/** @brief 打开目录以便 dir_read 迭代 */
 int lfs_dir_open(lfs_t *lfs, lfs_dir_t *dir, const char *path) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6390,6 +7104,7 @@ int lfs_dir_open(lfs_t *lfs, lfs_dir_t *dir, const char *path) {
     return err;
 }
 
+/** @brief 关闭目录 */
 int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6404,6 +7119,9 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir) {
     return err;
 }
 
+/**
+ * @brief 迭代目录项；返回 1=有条目、0=结束（注意与文件 read 语义不同）
+ */
 int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6419,6 +7137,7 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
     return err;
 }
 
+/** @brief 目录定位（off 必须来自 dir_tell） */
 int lfs_dir_seek(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6434,6 +7153,7 @@ int lfs_dir_seek(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
     return err;
 }
 
+/** @brief 目录当前位置（仅可供 seek 回放，数值本身无业务含义） */
 lfs_soff_t lfs_dir_tell(lfs_t *lfs, lfs_dir_t *dir) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6448,6 +7168,7 @@ lfs_soff_t lfs_dir_tell(lfs_t *lfs, lfs_dir_t *dir) {
     return res;
 }
 
+/** @brief 目录迭代回到开头 */
 int lfs_dir_rewind(lfs_t *lfs, lfs_dir_t *dir) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6462,6 +7183,7 @@ int lfs_dir_rewind(lfs_t *lfs, lfs_dir_t *dir) {
     return err;
 }
 
+/** @brief 查询盘上几何/版本/上限（fsinfo） */
 int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6476,6 +7198,7 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo) {
     return err;
 }
 
+/** @brief 已用块数（共享 COW 块重复计数，best effort） */
 lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6490,6 +7213,7 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
     return res;
 }
 
+/** @brief 遍历全部在用块（坏块管理/镜像/统计的底座） */
 int lfs_fs_traverse(lfs_t *lfs, int (*cb)(void *, lfs_block_t), void *data) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6506,6 +7230,7 @@ int lfs_fs_traverse(lfs_t *lfs, int (*cb)(void *, lfs_block_t), void *data) {
 }
 
 #ifndef LFS_READONLY
+/** @brief 显式完成遗留中间态（不等下一次写操作） */
 int lfs_fs_mkconsistent(lfs_t *lfs) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6522,6 +7247,7 @@ int lfs_fs_mkconsistent(lfs_t *lfs) {
 #endif
 
 #ifndef LFS_READONLY
+/** @brief 保洁：mkconsistent + 压实超阈值元数据 + 预热分配器 */
 int lfs_fs_gc(lfs_t *lfs) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6538,6 +7264,7 @@ int lfs_fs_gc(lfs_t *lfs) {
 #endif
 
 #ifndef LFS_READONLY
+/** @brief 扩容到新块数（重写超块；收缩仅限无越界占用时） */
 int lfs_fs_grow(lfs_t *lfs, lfs_size_t block_count) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -6554,6 +7281,7 @@ int lfs_fs_grow(lfs_t *lfs, lfs_size_t block_count) {
 #endif
 
 #ifdef LFS_MIGRATE
+/** @brief v1→v2 在线迁移（需 LFS_MIGRATE；失败时 v1 数据不受损） */
 int lfs_migrate(lfs_t *lfs, const struct lfs_config *cfg) {
     int err = LFS_LOCK(cfg);
     if (err) {

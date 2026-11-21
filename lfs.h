@@ -75,6 +75,11 @@ typedef uint32_t lfs_block_t;
 
 // Possible error codes, these are negative to allow
 // valid positive return values
+/**
+ * 错误码约定：全部为负值（数值借自 POSIX errno），这样带返回值的
+ * 接口（read/write/seek…）用正数表成功、负数表错误，一个 int 双语义。
+ * 移植者的 bd 回调也可以直接返回这些负错误码，littlefs 原样向上传播。
+ */
 enum lfs_error {
     LFS_ERR_OK          = 0,    // No error
     LFS_ERR_IO          = -5,   // Error during device operation
@@ -94,6 +99,12 @@ enum lfs_error {
 };
 
 // File types
+/**
+ * tag 类型常量：与盘上 32 位 tag 的 type3 字段一一对应（见 SPEC.md）。
+ * 0x0xx=名字、0x2xx=结构（inline/ctz/dir）、0x3xx=用户属性、
+ * 0x4xx=增删（SPLICE）、0x5xx=CRC、0x6xx=tail、0x7xx=全局状态。
+ * 用户只会见到 LFS_TYPE_REG/LFS_TYPE_DIR 两种。
+ */
 enum lfs_type {
     // file types
     LFS_TYPE_REG            = 0x001,
@@ -129,6 +140,11 @@ enum lfs_type {
 };
 
 // File open flags
+/**
+ * 打开标志：低 4 位是 POSIX 风格读写模式，0x0100+ 是创建语义；
+ * 0x00010000+ 是内部状态位（DIRTY/WRITING/…），用户勿设。
+ * LFS_READONLY 编译时写相关标志整体消失。
+ */
 enum lfs_open_flags {
     // open flags
     LFS_O_RDONLY = 1,         // Open a file as read only
@@ -163,6 +179,23 @@ enum lfs_whence_flags {
 
 
 // Configuration provided during initialization of the littlefs
+/**
+ * 移植的核心：把 littlefs 绑到任何块设备上的全部接口与几何参数。
+ *
+ * 必须实现的四个回调（context 可携带私有状态）：
+ *   read  —— 读（任意对齐，块内偏移；必须返回一致数据）
+ *   prog  —— 编程（只能把 1 写成 0，且目标必须先擦除）
+ *   erase —— 擦除（整块恢复全 1；可返回 LFS_ERR_CORRUPT 报坏块）
+ *   sync  —— 落盘（若有写缓存必须在此冲刷，否则掉电一致性失效！）
+ *
+ * 几何约束（lfs_init 会逐条断言）：
+ *   block_size % cache_size == 0，cache_size % (read/prog_size) == 0；
+ *   block_size >= 128 保证 CTZ 指针不溢出块；
+ *   RAM 预算 = 2*cache_size + lookahead_size + 每文件 cache_size。
+ *
+ * 可选缓冲（read_buffer/prog_buffer/lookahead_buffer/静态文件缓冲）
+ * 全部提供后 littlefs 运行期零 malloc。
+ */
 struct lfs_config {
     // Opaque user provided context that can be used to pass
     // information to the block device operations
@@ -302,6 +335,10 @@ struct lfs_config {
 };
 
 // File info structure
+/**
+ * stat/dir_read 的产出：类型（REG/DIR）+ 大小（仅 REG 有效）+ 名字。
+ * 名字长度由 LFS_NAME_MAX 决定，缩减它可直接省 RAM（info 会变大）。
+ */
 struct lfs_info {
     // Type of the file, either LFS_TYPE_REG or LFS_TYPE_DIR
     uint8_t type;
@@ -317,6 +354,10 @@ struct lfs_info {
 };
 
 // Filesystem info structure
+/**
+ * lfs_fs_stat 的产出：盘上格式版本 + 几何（块大小/数量）+ 三个上限。
+ * 上限以"盘上 superblock 记录 ∩ 本机编译配置"为准。
+ */
 struct lfs_fsinfo {
     // On-disk version.
     uint32_t disk_version;
@@ -339,6 +380,10 @@ struct lfs_fsinfo {
 
 // Custom attribute structure, used to describe custom attributes
 // committed atomically during file writes.
+/**
+ * 自定义属性描述：8 位 type 标识 + 缓冲。随文件 sync/close 在同一次
+ * 元数据提交里原子写盘；type 相同即覆盖，可当小型 xattr 用。
+ */
 struct lfs_attr {
     // 8-bit type of attribute, provided by user and used to
     // identify the attribute
@@ -352,6 +397,10 @@ struct lfs_attr {
 };
 
 // Optional configuration provided during lfs_file_opencfg
+/**
+ * per-file 配置：buffer 提供后该文件运行期零 malloc；attrs 列表
+ * 声明后打开即读、sync 即写（保证属性与文件内容原子一致）。
+ */
 struct lfs_file_config {
     // Optional statically allocated file buffer. Must be cache_size.
     // By default lfs_malloc is used to allocate this buffer.
@@ -376,6 +425,10 @@ struct lfs_file_config {
 
 
 /// internal littlefs data structures ///
+/**
+ * 通用缓存描述：缓存哪个块、什么偏移起、多长、数据区。
+ * littlefs 的读缓存/写缓存/每文件缓存都是这个形状。
+ */
 typedef struct lfs_cache {
     lfs_block_t block;
     lfs_off_t off;
@@ -383,6 +436,17 @@ typedef struct lfs_cache {
     uint8_t *buffer;
 } lfs_cache_t;
 
+/**
+ * 元数据对的 RAM 镜像（全文件系统最核心的状态结构）：
+ *   pair[2] —— 两块地址；约定 pair[0] 是最新提交所在块
+ *   rev     —— 最新块的 revision count（磨损次数+新旧裁决）
+ *   off     —— 日志尾偏移（下次 commit 的追加点）
+ *   etag    —— 日志尾上一条 tag（XOR 链头，续写时接着异或）
+ *   count   —— 本对内条目（文件）数
+ *   erased  —— 日志尾是否仍处擦除态（决定能否直接追加）
+ *   split   —— 是否有 hardtail（目录跨块分家过）
+ *   tail[2] —— 下一对的指针（目录链/超块链用）
+ */
 typedef struct lfs_mdir {
     lfs_block_t pair[2];
     uint32_t rev;
@@ -395,6 +459,10 @@ typedef struct lfs_mdir {
 } lfs_mdir_t;
 
 // littlefs directory type
+/**
+ * 打开的目录：mlist 节点（id/type/m）+ 迭代状态（pos/id/head）。
+ * pos 0/1 是合成的 "."/".."；head 记住头块以便 rewind。
+ */
 typedef struct lfs_dir {
     struct lfs_dir *next;
     uint16_t id;
@@ -406,6 +474,15 @@ typedef struct lfs_dir {
 } lfs_dir_t;
 
 // littlefs file type
+/**
+ * 打开的文件：
+ *   ctz.head/size —— CTZ 跳表尾块与文件大小（inline 文件 head=-2）
+ *   flags         —— DIRTY(待提交)/WRITING(有未落盘写)/READING/
+ *                    ERRED(写错误后禁提交)/INLINE(数据在元数据对里)
+ *   block/off     —— 当前读写所在的块与偏移（缓存未命中时重定位）
+ *   cache         —— 本文件的私有小缓存（cache_size 字节）
+ * 写路径在 RAM 里推进 pos/cache，sync/close 时才一次性提交。
+ */
 typedef struct lfs_file {
     struct lfs_file *next;
     uint16_t id;
@@ -426,6 +503,10 @@ typedef struct lfs_file {
     const struct lfs_file_config *cfg;
 } lfs_file_t;
 
+/**
+ * superblock 条目的 RAM 形态：格式化时写入，挂载时读出校验
+ * （版本不兼容/几何不匹配都会拒绝挂载）。
+ */
 typedef struct lfs_superblock {
     uint32_t version;
     lfs_size_t block_size;
@@ -435,12 +516,29 @@ typedef struct lfs_superblock {
     lfs_size_t attr_max;
 } lfs_superblock_t;
 
+/**
+ * 全局状态（RAM 形态）：tag+pair 共 12 字节，delta 分布在盘上各
+ * 元数据对的 MOVESTATE 里，XOR 聚合即得。三个实例分工：
+ *   gstate —— RAM 中的当前值（可能尚未落盘）
+ *   gdisk  —— 最近一次提交到盘上的值（两者之差=待提交 delta）
+ *   gdelta —— 从其它对"偷"来的 delta（compact/drop 搬运时暂存）
+ */
 typedef struct lfs_gstate {
     uint32_t tag;
     lfs_block_t pair[2];
 } lfs_gstate_t;
 
 // The littlefs filesystem type
+/**
+ * 文件系统对象（用户分配，可多实例并存）——RAM 预算一览：
+ *   rcache/pcache   2*cache_size，全局读写缓存
+ *   lookahead       lookahead_size，空闲块位图窗口
+ *   root[2]         根目录元数据对
+ *   mlist           打开的 file/dir 链（节点在用户对象里，无额外 RAM）
+ *   seed            各对 CRC 聚合出的伪随机数（分配起点用）
+ *   gstate/gdisk/gdelta 3*12 字节全局状态
+ * 除此之外没有任何随文件数增长的数据结构——RAM 严格有界。
+ */
 typedef struct lfs {
     lfs_cache_t rcache;
     lfs_cache_t pcache;
@@ -482,6 +580,8 @@ typedef struct lfs {
 /// Filesystem functions ///
 
 #ifndef LFS_READONLY
+// 格式化块设备。会 clobber lfs 对象且不保持挂载态；config 需清零。
+// 错误：负错误码（含块设备回调透传）。
 // Format a block device with the littlefs
 //
 // Requires a littlefs object and config struct. This clobbers the littlefs
@@ -492,6 +592,9 @@ typedef struct lfs {
 int lfs_format(lfs_t *lfs, const struct lfs_config *config);
 #endif
 
+// 挂载。lfs 与 config 必须在整个挂载期存活；可多实例并存。
+// 错误：LFS_ERR_CORRUPT（找不到有效超块）等负错误码。
+// 重入：LFS_THREADSAFE 时内部全程持锁。
 // Mounts a littlefs
 //
 // Requires a littlefs object and config struct. Multiple filesystems
@@ -502,6 +605,7 @@ int lfs_format(lfs_t *lfs, const struct lfs_config *config);
 // Returns a negative error code on failure.
 int lfs_mount(lfs_t *lfs, const struct lfs_config *config);
 
+// 卸载：仅释放资源（脏数据已在各 sync/close 提交）。
 // Unmounts a littlefs
 //
 // Does nothing besides releasing any allocated resources.
@@ -511,6 +615,8 @@ int lfs_unmount(lfs_t *lfs);
 /// General operations ///
 
 #ifndef LFS_READONLY
+// 删除；目录必须为空（LFS_ERR_NOTEMPTY）。原子操作，
+// 掉电后由 deorphan 兜底，绝不产生半删除状态。
 // Removes a file or directory
 //
 // If removing a directory, the directory must be empty.
@@ -519,6 +625,8 @@ int lfs_remove(lfs_t *lfs, const char *path);
 #endif
 
 #ifndef LFS_READONLY
+// 重命名/移动。目标存在必须同类型（目录还须为空）；
+// 跨目录移动由 gstate/move 机制保证原子（不丢不复制）。
 // Rename or move a file or directory
 //
 // If the destination exists, it must match the source in type.
@@ -528,12 +636,15 @@ int lfs_remove(lfs_t *lfs, const char *path);
 int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
 #endif
 
+// stat：填 type/size/name；不存在返回 LFS_ERR_NOENT。
 // Find info about a file or directory
 //
 // Fills out the info structure, based on the specified file or directory.
 // Returns a negative error code on failure.
 int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info);
 
+// 读属性：返回盘上实际长度（可大于缓冲，超出部分被截断、
+// 不足补 0）；属性不存在返回 LFS_ERR_NOATTR 且缓冲清零。
 // Get a custom attribute
 //
 // Custom attributes are uniquely identified by an 8-bit type and limited
@@ -550,6 +661,7 @@ lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
         uint8_t type, void *buffer, lfs_size_t size);
 
 #ifndef LFS_READONLY
+// 写属性（不存在则隐式创建）；一次元数据提交内原子生效。
 // Set custom attributes
 //
 // Custom attributes are uniquely identified by an 8-bit type and limited
@@ -562,6 +674,7 @@ int lfs_setattr(lfs_t *lfs, const char *path,
 #endif
 
 #ifndef LFS_READONLY
+// 删属性（不存在则无操作，仍返回 0）。
 // Removes a custom attribute
 //
 // If an attribute is not found, nothing happens.
@@ -574,6 +687,8 @@ int lfs_removeattr(lfs_t *lfs, const char *path, uint8_t type);
 /// File operations ///
 
 #ifndef LFS_NO_MALLOC
+// 打开文件（缓冲走 malloc）。flags 组合见 enum lfs_open_flags。
+// 错误：NOENT/EXIST/ISDIR/NAMETOOLONG/NOMEM 等。
 // Open a file
 //
 // The mode that the file is opened in is determined by the flags, which
@@ -587,6 +702,8 @@ int lfs_file_open(lfs_t *lfs, lfs_file_t *file,
 // thus use lfs_file_opencfg() with config.buffer set.
 #endif
 
+// 打开文件（带 per-file 配置：静态缓冲/自定义属性）。
+// config 结构须在文件打开期间存活。
 // Open a file with extra configuration
 //
 // The mode that the file is opened in is determined by the flags, which
@@ -601,6 +718,7 @@ int lfs_file_opencfg(lfs_t *lfs, lfs_file_t *file,
         const char *path, int flags,
         const struct lfs_file_config *config);
 
+// 关闭：隐式 sync 后释放资源。写后必须 close/sync 才落盘。
 // Close a file
 //
 // Any pending writes are written out to storage as though
@@ -609,12 +727,14 @@ int lfs_file_opencfg(lfs_t *lfs, lfs_file_t *file,
 // Returns a negative error code on failure.
 int lfs_file_close(lfs_t *lfs, lfs_file_t *file);
 
+// 手动提交：数据+元数据（含 attrs）一次原子落盘。
 // Synchronize a file on storage
 //
 // Any pending writes are written out to storage.
 // Returns a negative error code on failure.
 int lfs_file_sync(lfs_t *lfs, lfs_file_t *file);
 
+// 读：返回实际字节数（0=EOF）或负错误码。
 // Read data from file
 //
 // Takes a buffer and size indicating where to store the read data.
@@ -623,6 +743,8 @@ lfs_ssize_t lfs_file_read(lfs_t *lfs, lfs_file_t *file,
         void *buffer, lfs_size_t size);
 
 #ifndef LFS_READONLY
+// 写：返回写入字节数。close/sync 前仅存于 RAM（掉电丢未提交写入，
+// 但已提交数据不受影响——这是"文件更新原子性"的边界）。
 // Write data to file
 //
 // Takes a buffer and size indicating the data to write. The file will not
@@ -633,6 +755,7 @@ lfs_ssize_t lfs_file_write(lfs_t *lfs, lfs_file_t *file,
         const void *buffer, lfs_size_t size);
 #endif
 
+// 定位：返回新位置或负错误码；whence 见 enum lfs_whence_flags。
 // Change the position of the file
 //
 // The change in position is determined by the offset and whence flag.
@@ -641,24 +764,28 @@ lfs_soff_t lfs_file_seek(lfs_t *lfs, lfs_file_t *file,
         lfs_soff_t off, int whence);
 
 #ifndef LFS_READONLY
+// 截断：缩短丢尾（可退回 inline 省 RAM），扩展补 0。
 // Truncates the size of the file to the specified size
 //
 // Returns a negative error code on failure.
 int lfs_file_truncate(lfs_t *lfs, lfs_file_t *file, lfs_off_t size);
 #endif
 
+// 等价 seek(0, SEEK_CUR)。
 // Return the position of the file
 //
 // Equivalent to lfs_file_seek(lfs, file, 0, LFS_SEEK_CUR)
 // Returns the position of the file, or a negative error code on failure.
 lfs_soff_t lfs_file_tell(lfs_t *lfs, lfs_file_t *file);
 
+// 等价 seek(0, SEEK_SET)。
 // Change the position of the file to the beginning of the file
 //
 // Equivalent to lfs_file_seek(lfs, file, 0, LFS_SEEK_SET)
 // Returns a negative error code on failure.
 int lfs_file_rewind(lfs_t *lfs, lfs_file_t *file);
 
+// 文件大小；含未提交写入（WRITING 时取 max(pos, size)）。
 // Return the size of the file
 //
 // Similar to lfs_file_seek(lfs, file, 0, LFS_SEEK_END)
@@ -669,24 +796,28 @@ lfs_soff_t lfs_file_size(lfs_t *lfs, lfs_file_t *file);
 /// Directory operations ///
 
 #ifndef LFS_READONLY
+// 建目录：父不存在 NOENT、重名 EXIST、超长 NAMETOOLONG。
 // Create a directory
 //
 // Returns a negative error code on failure.
 int lfs_mkdir(lfs_t *lfs, const char *path);
 #endif
 
+// 打开目录：后续用 lfs_dir_read 迭代（首两项是 "."/".."）。
 // Open a directory
 //
 // Once open a directory can be used with read to iterate over files.
 // Returns a negative error code on failure.
 int lfs_dir_open(lfs_t *lfs, lfs_dir_t *dir, const char *path);
 
+// 关闭目录并释放迭代状态。
 // Close a directory
 //
 // Releases any allocated resources.
 // Returns a negative error code on failure.
 int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
 
+// 迭代：1=info 有效；0=到尾；负=错误（注意与文件 read 的返回语义不同）。
 // Read an entry in the directory
 //
 // Fills out the info structure, based on the specified file or directory.
@@ -694,6 +825,7 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
 // or a negative error code on failure.
 int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info);
 
+// 目录定位：off 必须来自 lfs_dir_tell，否则 INVAL。
 // Change the position of the directory
 //
 // The new off must be a value previous returned from tell and specifies
@@ -702,6 +834,7 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info);
 // Returns a negative error code on failure.
 int lfs_dir_seek(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off);
 
+// 返回迭代位置（仅用于 seek 回放，数值无业务含义）。
 // Return the position of the directory
 //
 // The returned offset is only meant to be consumed by seek and may not make
@@ -710,6 +843,7 @@ int lfs_dir_seek(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off);
 // Returns the position of the directory, or a negative error code on failure.
 lfs_soff_t lfs_dir_tell(lfs_t *lfs, lfs_dir_t *dir);
 
+// 迭代回到开头。
 // Change the position of the directory to the beginning of the directory
 //
 // Returns a negative error code on failure.
@@ -718,12 +852,14 @@ int lfs_dir_rewind(lfs_t *lfs, lfs_dir_t *dir);
 
 /// Filesystem-level filesystem operations
 
+// 盘上信息：版本/块大小/块数/三个上限。
 // Find on-disk info about the filesystem
 //
 // Fills out the fsinfo structure based on the filesystem found on-disk.
 // Returns a negative error code on failure.
 int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
 
+// 已用块数。共享 COW 块会重复计数 => 结果只会偏大（best effort）。
 // Finds the current size of the filesystem
 //
 // Note: Result is best effort. If files share COW structures, the returned
@@ -732,6 +868,7 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
 // Returns the number of allocated blocks, or a negative error code on failure.
 lfs_ssize_t lfs_fs_size(lfs_t *lfs);
 
+// 遍历全部在用块（回调可中断遍历：返回非 0 即停）。
 // Traverse through all blocks in use by the filesystem
 //
 // The provided callback will be called with each block address that is
@@ -742,6 +879,8 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs);
 int lfs_fs_traverse(lfs_t *lfs, int (*cb)(void*, lfs_block_t), void *data);
 
 #ifndef LFS_READONLY
+// 显式完成所有遗留中间态（move/孤儿/超块升级），
+// 不必等到下一次写操作才隐式触发。
 // Attempt to make the filesystem consistent and ready for writing
 //
 // Calling this function is not required, consistency will be implicitly
@@ -754,6 +893,8 @@ int lfs_fs_mkconsistent(lfs_t *lfs);
 #endif
 
 #ifndef LFS_READONLY
+// 保洁三件事：mkconsistent → 压实超阈值元数据 → 预热分配器。
+// 适合在空闲时段调用，把昂贵整理移出关键写路径。
 // Attempt any janitorial work
 //
 // This currently:
@@ -772,6 +913,8 @@ int lfs_fs_gc(lfs_t *lfs);
 #endif
 
 #ifndef LFS_READONLY
+// 扩容（重写超块 block_count）。收缩默认不支持
+//（LFS_SHRINKNONRELOCATING 下越界块全空闲才允许）。
 // Grows the filesystem to a new size, updating the superblock with the new
 // block count.
 //
@@ -787,6 +930,8 @@ int lfs_fs_grow(lfs_t *lfs, lfs_size_t block_count);
 
 #ifndef LFS_READONLY
 #ifdef LFS_MIGRATE
+// v1→v2 在线迁移（需 LFS_MIGRATE）。掉电安全：v1 数据只读不动，
+// 失败重跑即可；成功后 v1 结构不可再挂载。
 // Attempts to migrate a previous version of littlefs
 //
 // Behaves similarly to the lfs_format function. Attempts to mount
